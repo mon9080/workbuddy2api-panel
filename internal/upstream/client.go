@@ -1243,9 +1243,18 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// CLI 身份：body 字段对齐（cache_retention/verbosity/reasoning_summary +
 	// 剔除 Responses 专属字段，见 cliidentity.go）+ gzip 压缩（官方生产形态恒压）。
 	// 桌面端身份 body 路径零回归（不压缩、不加字段）。
+	//
+	// 版本适配门禁在此收口（而非只在 handler）：autotask / blackcat 等内部
+	// 合成对话也走本函数——拦截期它们同样不得以未适配 CLI 指纹出站
+	//（交叉审查发现 #1）。哨兵错误 ErrIdentityGateBlocked：请求级语义，
+	// 调用方不罚号、不轮转。
 	cliGzipped := false
 	if c.cliIdentity() {
-		prepared = applyCLIBodyFields(prepared, meta.ConversationID)
+		if blocked, detail := c.IdentityGateBlocked(); blocked {
+			log.Printf("WARN: [upstream] chat_stream acct=%s: %s", logfmt.Label(a.UID, a.Nickname), detail)
+			return nil, 0, nil, fmt.Errorf("%w: %s", ErrIdentityGateBlocked, detail)
+		}
+		prepared = applyCLIBodyFields(prepared, meta.ConversationID, a.UID)
 		if gz, ok := gzipCLIBody(prepared); ok {
 			prepared = gz
 			cliGzipped = true

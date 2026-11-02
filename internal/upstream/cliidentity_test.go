@@ -242,7 +242,7 @@ func TestApplyCLIBodyFields(t *testing.T) {
 	convID := "01a19c44-90ad-7bc5-9891-a80d2fe34e7a"
 	t.Run("补默认字段并剔除Responses专属字段", func(t *testing.T) {
 		in := `{"model":"m","messages":[{"role":"user","content":"hi"}],"metadata":{"a":1},"conversation_id":"c1","previous_response_id":"p1"}`
-		out := applyCLIBodyFields([]byte(in), convID)
+		out := applyCLIBodyFields([]byte(in), convID, "u-test")
 		for _, want := range []string{`"cache_retention":"long"`, `"verbosity":"high"`} {
 			if !strings.Contains(string(out), want) {
 				t.Errorf("body 缺 %s: %s", want, out)
@@ -257,7 +257,7 @@ func TestApplyCLIBodyFields(t *testing.T) {
 	t.Run("extra_vars自洽派生", func(t *testing.T) {
 		// 首轮（1 条 user 消息）：stepIndex=0，对齐官方 golden。
 		in := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
-		out := applyCLIBodyFields([]byte(in), convID)
+		out := applyCLIBodyFields([]byte(in), convID, "u-test")
 		var obj map[string]any
 		if err := json.Unmarshal(out, &obj); err != nil {
 			t.Fatalf("解析失败: %v", err)
@@ -289,18 +289,19 @@ func TestApplyCLIBodyFields(t *testing.T) {
 		if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(meta.ContextWindowID) {
 			t.Errorf("contextWindowId 非 UUID 形态: %q", meta.ContextWindowID)
 		}
-		out2 := applyCLIBodyFields([]byte(in), convID)
+		out2 := applyCLIBodyFields([]byte(in), convID, "u-test")
 		if !strings.Contains(string(out2), meta.ContextWindowID) {
 			t.Errorf("同会话 contextWindowId 应稳定: %s", out2)
 		}
 	})
-	t.Run("stepIndex随轮次增长", func(t *testing.T) {
-		// 3 条 user 消息 = 已完成 2 轮。harnessMetadata 是字符串化 JSON，
-		// 断言按转义后形态匹配。
+	t.Run("stepIndex恒0-官方按轮重置", func(t *testing.T) {
+		// 官方 allocateHarnessStep 按 conversationRequestId 键控：**新一轮重置 0**，
+		// 轮内 tool 循环才递增（指纹审查 B-2）。网关每请求都是轮内首个模型调用，
+		// 多轮会话也恒 0。
 		in := `{"model":"m","messages":[{"role":"user","content":"1"},{"role":"assistant","content":"a"},{"role":"user","content":"2"},{"role":"assistant","content":"b"},{"role":"user","content":"3"}]}`
-		out := string(applyCLIBodyFields([]byte(in), convID))
-		if !strings.Contains(out, `\"stepIndex\":2`) {
-			t.Errorf("3 轮会话 stepIndex 应为 2: %s", out)
+		out := string(applyCLIBodyFields([]byte(in), convID, "u-test"))
+		if !strings.Contains(out, `\"stepIndex\":0`) {
+			t.Errorf("多轮会话 stepIndex 应恒为 0: %s", out)
 		}
 	})
 	t.Run("effort已表达时补reasoning_summary", func(t *testing.T) {
@@ -309,25 +310,25 @@ func TestApplyCLIBodyFields(t *testing.T) {
 			`{"model":"m","reasoningEffort":"low"}`,
 			`{"model":"m","reasoning":{"effort":"low"}}`,
 		} {
-			out := string(applyCLIBodyFields([]byte(body), convID))
+			out := string(applyCLIBodyFields([]byte(body), convID, "u-test"))
 			if !strings.Contains(out, `"reasoning_summary":"auto"`) {
 				t.Errorf("effort 表达后应补 reasoning_summary: %s → %s", body, out)
 			}
 		}
 	})
 	t.Run("effort未表达不补summary", func(t *testing.T) {
-		out := string(applyCLIBodyFields([]byte(`{"model":"m","messages":[]}`), convID))
+		out := string(applyCLIBodyFields([]byte(`{"model":"m","messages":[]}`), convID, "u-test"))
 		if strings.Contains(out, "reasoning_summary") {
 			t.Errorf("effort 缺失不应补 reasoning_summary: %s", out)
 		}
 		// 非字符串形态（数字/null）不算表达（官方 typeof === "string" 判据）。
-		out = string(applyCLIBodyFields([]byte(`{"model":"m","reasoning_effort":3,"reasoning":{"effort":null}}`), convID))
+		out = string(applyCLIBodyFields([]byte(`{"model":"m","reasoning_effort":3,"reasoning":{"effort":null}}`), convID, "u-test"))
 		if strings.Contains(out, "reasoning_summary") {
 			t.Errorf("非字符串 effort 不应补 reasoning_summary: %s", out)
 		}
 	})
 	t.Run("显式值不覆盖", func(t *testing.T) {
-		out := string(applyCLIBodyFields([]byte(`{"model":"m","cache_retention":"short","verbosity":"low","reasoning_summary":"off","reasoning_effort":"high","extra_vars":{"x":1}}`), convID))
+		out := string(applyCLIBodyFields([]byte(`{"model":"m","cache_retention":"short","verbosity":"low","reasoning_summary":"off","reasoning_effort":"high","extra_vars":{"x":1}}`), convID, "u-test"))
 		for _, keep := range []string{`"cache_retention":"short"`, `"verbosity":"low"`, `"reasoning_summary":"off"`, `"x":1`} {
 			if !strings.Contains(out, keep) {
 				t.Errorf("显式值被覆盖（期望保留 %s）: %s", keep, out)
@@ -336,7 +337,7 @@ func TestApplyCLIBodyFields(t *testing.T) {
 	})
 	t.Run("坏body原样返回", func(t *testing.T) {
 		in := []byte("{not json")
-		if out := applyCLIBodyFields(in, convID); string(out) != string(in) {
+		if out := applyCLIBodyFields(in, convID, "u-test"); string(out) != string(in) {
 			t.Errorf("坏 body 应原样返回: %s", out)
 		}
 	})

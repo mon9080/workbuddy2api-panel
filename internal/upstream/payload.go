@@ -50,6 +50,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 	normalizeToolChoice(obj)
 	normalizeToolPatterns(obj)
+	normalizeToolsEntries(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
 	dropReasoningContentParts(obj)
@@ -221,6 +222,68 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 		obj[key] = lowest
 		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
 	}
+}
+
+// normalizeToolsEntries 校验 tools[] 条目并剔除上游必拒形态（对齐 hub PR #726
+// 的实测结论：上游 400 code 11133，param 路径 `tools[i].function.name`）：
+//   - 非对象条目、非 function 类型且无 function 载荷的服务端工具声明
+//     （如 {"type":"web_search"}）→ 剔除（该类声明无 name，透传必 400）
+//   - function.name 缺失/空/含 [A-Za-z0-9_-] 之外字符/超 64 字符 → 剔除
+//     （裸 name 形态——Responses 风格——同口径校验）
+//   - 同名条目去重（首个保留）
+//   - 全部剔净时删除 tools 键（空数组上游同样拒收）
+//
+// 合法条目一律原样保留不改名——模型回发的 tool_call 名必须与客户端声明一致，
+// 改名会让客户端无法匹配执行。
+func normalizeToolsEntries(obj map[string]any) {
+	rawTools, ok := obj["tools"].([]any)
+	if !ok || len(rawTools) == 0 {
+		return
+	}
+	seen := make(map[string]bool, len(rawTools))
+	kept := make([]any, 0, len(rawTools))
+	for _, raw := range rawTools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, hasFn := tool["function"].(map[string]any)
+		var name string
+		if hasFn {
+			name, _ = fn["name"].(string)
+		} else {
+			name, _ = tool["name"].(string) // Responses 风格裸 name
+		}
+		// 非 function 类型且无 function 载荷（也无裸 name）的服务端声明：剔除。
+		if t, _ := tool["type"].(string); t != "" && t != "function" && !hasFn && name == "" {
+			continue
+		}
+		if !validToolFunctionName(name) || seen[name] {
+			continue
+		}
+		seen[name] = true
+		kept = append(kept, raw)
+	}
+	if len(kept) == 0 {
+		delete(obj, "tools")
+		return
+	}
+	obj["tools"] = kept
+}
+
+// validToolFunctionName 上游对 function.name 的字符白名单与长度上限
+// （[A-Za-z0-9_-]，≤64）。空名同样非法。
+func validToolFunctionName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。

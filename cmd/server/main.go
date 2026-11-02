@@ -172,6 +172,21 @@ func main() {
 	up.IdentityStrictGate.Store(cfg.Upstream.IdentityStrictGate)
 	up.IdentityVersionCheck.Store(cfg.Upstream.IdentityVersionCheck)
 	up.StartIdentityVersionLoop()
+	// 身份生效可见性（交叉审查 P2）：启动打印当前身份族与已适配版本；
+	// cli 身份下 user_agent/client_name 对 chat 路径静默失效，显式 WARN 提示。
+	identity := cfg.Upstream.ChatIdentity
+	if identity != "desktop" && identity != "cli" {
+		log.Printf("WARN: [config] upstream.chat_identity=%q 非法（cli/desktop），回落 desktop", identity)
+		identity = "desktop"
+	}
+	log.Printf("[upstream] chat 出站身份: %s (verified CLI %s, strict_gate=%v, version_check=%v)",
+		identity, upstream.VerifiedCLIVersion, cfg.Upstream.IdentityStrictGate, cfg.Upstream.IdentityVersionCheck)
+	if identity == "cli" && cfg.Upstream.UserAgent != "" {
+		log.Printf("WARN: [config] cli 身份下 upstream.user_agent 对 chat 路径不生效（CLI 头族整族接管）；如需自定义 UA 请切 desktop 身份")
+	}
+	if identity == "cli" && cfg.Upstream.ClientName != "" {
+		log.Printf("WARN: [config] cli 身份下 upstream.client_name 对 chat 路径不生效（归因头按 CLI 形态固定）")
+	}
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
@@ -596,6 +611,9 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "upstream.user_agent")
 	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）。
 	out = append(out, "cn.chat_base")
+	// 身份族与环境覆盖值在装配期写进出站 client（main.go 的 up.ChatIdentity=... 等），
+	// 与 user_agent 同口径：面板改后需重启（交叉审查 P4：此前漏列）。
+	out = append(out, "upstream.chat_identity", "upstream.identity_os", "upstream.identity_arch", "upstream.identity_node")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}

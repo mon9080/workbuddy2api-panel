@@ -105,18 +105,30 @@ if ! [[ "$NODE_VER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 log "校准运行 node 版本=$NODE_VER"
 
-# ---------- 5. Go oracle 比对 ----------
-cd "$REPO_DIR"
-if ! WB2A_ORACLE_GOLDEN="$CAPTURES/requests.jsonl" go test ./internal/upstream/ -run TestOracleGoldenDiff -v; then
-  log "❌ 新版 $LATEST 出站形态与实现存在漂移（见上方 diff）。不 bump，生产门禁继续拦截。"
-  log "   适配路径：按漂移字段修改 internal/upstream/cliidentity.go 后重跑本脚本。"
-  exit 4
-fi
-
-# ---------- 6. bump 版本常量 ----------
+# ---------- 5. 先 bump 候选常量，再跑比对（次序关键！）----------
+# oracle diff 对版本承载头（UA/X-IDE-Version/SDK/Node）做全等比对：测试跑在
+# 旧常量上必然失败（golden=新版，实现=旧版）→ bump 永远执行不到（交叉审查 P0）。
+# 正确次序：先把三个常量 bump 到候选值 → 用新常量编译的实现对新版 golden 比对
+# → 失败回滚常量并报警，成功则常量已是目标值、直接提交。
+restore_constants() {
+  git checkout -- internal/upstream/cliversion.go
+  log "已回滚版本常量（保持旧适配版本）"
+}
+trap 'restore_constants' EXIT
 sed -i "s/VerifiedCLIVersion = \"[^\"]*\"/VerifiedCLIVersion = \"$LATEST\"/" internal/upstream/cliversion.go
 sed -i "s/VerifiedSDKVersion = \"[^\"]*\"/VerifiedSDKVersion = \"$SDK\"/" internal/upstream/cliversion.go
 sed -i "s/VerifiedNodeVersion = \"[^\"]*\"/VerifiedNodeVersion = \"$NODE_VER\"/" internal/upstream/cliversion.go
+log "候选常量已 bump：CLI=$LATEST SDK=$SDK Node=$NODE_VER，开始 oracle 比对"
+
+cd "$REPO_DIR"
+if ! WB2A_ORACLE_GOLDEN="$CAPTURES/requests.jsonl" go test ./internal/upstream/ -run TestOracleGoldenDiff -v; then
+  restore_constants
+  trap - EXIT
+  log "❌ 新版 $LATEST 出站形态与实现存在漂移（见上方 diff）。已回滚 bump，生产门禁继续拦截。"
+  log "   适配路径：按漂移字段修改 internal/upstream/cliidentity.go 后重跑本脚本。"
+  exit 4
+fi
+trap - EXIT
 log "✅ 校准通过：VerifiedCLIVersion=$LATEST VerifiedSDKVersion=$SDK VerifiedNodeVersion=$NODE_VER"
 
 if [ "$CI_MODE" = "--ci" ]; then

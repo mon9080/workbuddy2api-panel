@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"runtime"
+	"strings"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -154,32 +155,38 @@ func (c *Client) injectCLIAttribution(req *http.Request, a *auth.Auth) {
 }
 
 // injectCLITraceHeaders CLI 链路头族：b3（单头形式）+ traceparent + baggage
-// + x-b3-parentspanid。既有 injectConversationHeaders 已覆盖 X-Conversation-* /
-// X-Request-* / X-B3-TraceId/SpanId/Sampled，此处只补官方多出的四头。
+// + x-b3-parentspanid，并**统一覆写** injectConversationHeaders 落的初值。
 //
-// 形态（golden 实测）：traceID=32hex（=会话请求 ID 同源）、spanID=16hex、
-// parentspanID=16hex；b3 = `<trace>-<span>-1-<parent>`；traceparent =
-// `00-<trace>-<span>-01`；baggage = `codebuddy.session_id=<conversationID>,
-// codebuddy.conversation_request_id=<requestID>`。
-//
-// conversationID/requestID 一律取 injectConversationHeaders 落到请求头上的
-// **生效值**（含空值兜底），保证 baggage 与 X-Conversation-ID 头一致——
-// 不读 meta 原始值（可能为空，与兜底头分叉）。
+// 官方源码证据（指纹审查，dist/codebuddy.js @9641614）：trace/span 由同一个
+// `eu` 对象派生——`X-B3-TraceId == b3.trace 段 == traceparent.trace 段`、
+// `X-B3-SpanId == b3.span 段 == traceparent.span 段`，同请求内三处一致；
+// traceId 为**均匀随机 32hex**（与 conversationRequestId 解耦——后者是 UUIDv7，
+// 时间戳前缀批量可辨，不得复用作 trace）。本实现全部覆写为同源派生值，
+// 保证五处（X-B3-TraceId/SpanId、B3、Traceparent、X-Trace-ID）一致。
+// parentspanID 由会话 ID 稳定派生（上游轮次的稳定父跨度）。
+// Connection: keep-alive 对齐官方 Node keepAlive agent（Go 持久连接默认不发此头）。
 func (c *Client) injectCLITraceHeaders(req *http.Request) {
 	convReqID := req.Header.Get("X-Conversation-Request-ID")
-	traceID := convReqID
-	if !validTraceID(traceID) {
-		traceID = req.Header.Get("X-Conversation-Message-ID")
-	}
-	// span 用 traceID 派生（同一轮对话内稳定，与官方「一次 user send 一个 span」
-	// 语义一致）；parent 用会话 ID 派生（上游轮次的稳定父跨度）。
-	spanID := deriveSpanID(traceID, "span")
+	traceID := deriveTraceID(convReqID)
+	spanID := deriveSpanID(convReqID, "span")
 	parentID := deriveSpanID(req.Header.Get("X-Conversation-ID"), "parent")
+	req.Header.Set("X-B3-TraceId", traceID)
+	req.Header.Set("X-B3-SpanId", spanID)
 	req.Header.Set("X-B3-ParentSpanId", parentID)
+	req.Header.Set("X-Trace-ID", traceID)
 	req.Header.Set("B3", traceID+"-"+spanID+"-1-"+parentID)
 	req.Header.Set("Traceparent", "00-"+traceID+"-"+spanID+"-01")
 	req.Header.Set("Baggage", "codebuddy.session_id="+req.Header.Get("X-Conversation-ID")+
 		",codebuddy.conversation_request_id="+convReqID)
+	req.Header.Set("Connection", "keep-alive")
+}
+
+// deriveTraceID 从会话请求 ID 稳定派生 32hex 均匀随机形态的 traceId
+// （官方 traceId 与请求 ID 解耦、分布均匀；派生值同时保证同轮重试/换号时
+// trace 稳定，聚合语义与既有 ChatMeta 一致）。
+func deriveTraceID(convReqID string) string {
+	sum := sha256.Sum256([]byte("cli-trace:" + convReqID))
+	return hex.EncodeToString(sum[:16])
 }
 
 // deriveSpanID 从种子串稳定派生 16 hex（B3 SpanId 合法长度）。
@@ -195,6 +202,10 @@ func deriveSpanID(seed, purpose string) string {
 // 保留项的取舍说明：X-Enterprise-Id / X-Domain 按账号透传（golden 为 custom-token
 // 匿名形态无此两头，但 cn 端点历史实测需要账号域声明过 11-128 通道校验——保守保留，
 // 真实登录态 CLI 的确切形态待部署期真实流量核对，golden 无法覆盖登录场景）。
+// **global 账号例外**：X-Domain 强制 www.workbuddy.ai（与出站端点同域），个人号
+// 加 X-No-Enterprise-Id: 1 显式声明——对齐桌面端 injectGlobalChatHeaders 的
+// 实测防 11140 逻辑（headers.go 注释：global 账号送错平台段/域头会触发风控；
+// 交叉审查发现 #3：CLI 分支不得无声丢弃这层防护）。
 func (c *Client) cliChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	h := req.Header
 	h.Set("Content-Type", "application/json")
@@ -209,16 +220,25 @@ func (c *Client) cliChatHeaders(req *http.Request, a *auth.Auth, clientIP string
 		h.Set("X-User-Id", a.UID)
 	}
 	if a != nil {
-		if a.EnterpriseID != "" {
-			h.Set("X-Enterprise-Id", a.EnterpriseID)
-		}
-		if d := a.DomainValue(); d != "" {
-			h.Set("X-Domain", d)
+		if a.IsGlobal() {
+			h.Set("X-Domain", "www.workbuddy.ai")
+			if a.EnterpriseID == "" {
+				h.Set("X-No-Enterprise-Id", "1")
+			}
+		} else {
+			if a.EnterpriseID != "" {
+				h.Set("X-Enterprise-Id", a.EnterpriseID)
+			}
+			if d := a.DomainValue(); d != "" {
+				h.Set("X-Domain", d)
+			}
 		}
 	}
 	c.injectCLIAttribution(req, a)
 	c.injectStainlessHeaders(req)
-	c.injectClientIP(req, clientIP)
+	// 不透传客户端 IP 头（X-Forwarded-For/X-Real-IP/X-Client-IP）：官方 CLI 是
+	// 端客户端，永不发代理头族——PassthroughIP 开启时这三头是网关特征
+	//（指纹审查 H-2）。需要 IP 透传的部署请用 desktop 身份。
 	c.injectConversationHeaders(req, meta)
 	c.injectCLITraceHeaders(req)
 }
@@ -250,16 +270,20 @@ func gzipCLIBody(body []byte) ([]byte, bool) {
 //     用户轮次数（user 消息数-1，CLI 的 step 语义）、contextWindowId=按会话 ID
 //     稳定派生的带横线 UUID（同会话同窗口，跨会话互异）、agent.depth=0；
 //     initiator="user"、interactionType="prompt"（官方主对话恒定值）
-//   - 剔除 metadata / conversation_id / previous_response_id（Responses API 与
-//     客户端自定义字段，官方 CLI chat 路径不发）
+//   - 剔除 metadata / conversation_id / previous_response_id / prompt_cache_key
+//     （Responses API 与客户端自定义字段，官方 CLI chat 路径不发；prompt_cache_key
+//     是本网关桌面身份时代的自有字段，官方 2.179.2 全量源码中不存在——CLI 身份
+//     下它是最直接的 body 层网关指纹，指纹审查 B-1）
 //
-// 所有字段均为缺省注入（客户端已写不覆盖）。
-func applyCLIBodyFields(body []byte, conversationID string) []byte {
+// 所有字段均为缺省注入（客户端已写不覆盖）。conversationID 为空时（客户端
+// 未带会话标识）以 uid 参与派生——否则全部空会话请求会共享同一个
+// contextWindowId，构成跨账号可关联的常量指纹（交叉审查发现 #4）。
+func applyCLIBodyFields(body []byte, conversationID, uid string) []byte {
 	if len(body) == 0 {
 		return body
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
 		return body
 	}
 	changed := false
@@ -276,12 +300,12 @@ func applyCLIBodyFields(body []byte, conversationID string) []byte {
 		changed = true
 	}
 	if _, has := obj["extra_vars"]; !has {
-		if ev := cliHarnessExtraVars(obj, conversationID); ev != nil {
+		if ev := cliHarnessExtraVars(obj, conversationID, uid); ev != nil {
 			obj["extra_vars"] = ev
 			changed = true
 		}
 	}
-	for _, drop := range [...]string{"metadata", "conversation_id", "previous_response_id"} {
+	for _, drop := range [...]string{"metadata", "conversation_id", "previous_response_id", "prompt_cache_key"} {
 		if _, has := obj[drop]; has {
 			delete(obj, drop)
 			changed = true
@@ -298,6 +322,10 @@ func applyCLIBodyFields(body []byte, conversationID string) []byte {
 }
 
 // cliHarnessMetadata 官方 extra_vars.harnessMetadata 的结构（序列化为字符串嵌入）。
+// StepIndex 恒 0：官方 allocateHarnessStep 按 conversationRequestId 键控计数——
+// **新一轮对话重置为 0**，轮内的 harness step（tool 循环的每次模型调用）才递增
+// （指纹审查 B-2，官方源码 @10357146）。网关转译的每个请求都是「一轮的首个模型
+// 调用」（tool 循环不经网关），恒 0 才是主路径形态。
 type cliHarnessMetadata struct {
 	SchemaVersion   int    `json:"schemaVersion"`
 	HarnessVersion  string `json:"harnessVersion"`
@@ -309,13 +337,13 @@ type cliHarnessMetadata struct {
 }
 
 // cliHarnessExtraVars 派生官方 CLI 形态的 extra_vars（自洽：同会话同窗口、
-// 轮次随历史增长、版本随指纹常量）。
-func cliHarnessExtraVars(obj map[string]any, conversationID string) map[string]any {
+// stepIndex 恒 0、版本随指纹常量）。
+func cliHarnessExtraVars(obj map[string]any, conversationID, uid string) map[string]any {
 	meta := cliHarnessMetadata{
 		SchemaVersion:   1,
 		HarnessVersion:  VerifiedCLIVersion,
-		StepIndex:       userTurnsCompleted(obj),
-		ContextWindowID: deriveContextWindowID(conversationID),
+		StepIndex:       0,
+		ContextWindowID: deriveContextWindowID(conversationID, uid),
 	}
 	meta.Agent.Depth = 0
 	metaJSON, err := json.Marshal(meta)
@@ -329,33 +357,23 @@ func cliHarnessExtraVars(obj map[string]any, conversationID string) map[string]a
 	}
 }
 
-// userTurnsCompleted 会话内已完成的用户轮次 = user 角色消息数 - 1（首条消息为
-// 第 0 步，对齐官方 golden 首轮 stepIndex=0）。无 messages 或解析失败按 0。
-func userTurnsCompleted(obj map[string]any) int {
-	msgs, ok := obj["messages"].([]any)
-	if !ok {
-		return 0
+// deriveContextWindowID 按会话 ID 稳定派生 UUIDv7 **形态**（版本 nibble 钉 7、
+// variant 位钉 10xx——官方 contextWindowId 实测为 v7 形态，指纹审查 B-3；完整
+// v7 的时间戳前缀与「同会话稳定」不可兼得，取舍为形态对齐 + 会话稳定）。
+// conversationID 为空时掺入 uid 隔离（跨账号绝不共享窗口——共享即跨账号关联
+// 指纹，与 X-Machine-ID 按 uid 派生的防关联哲学同向）。
+func deriveContextWindowID(conversationID, uid string) string {
+	seed := conversationID
+	if strings.TrimSpace(seed) == "" {
+		seed = "uid:" + uid
 	}
-	n := 0
-	for _, raw := range msgs {
-		if m, ok := raw.(map[string]any); ok {
-			if role, _ := m["role"].(string); role == "user" {
-				n++
-			}
-		}
+	sum := sha256.Sum256([]byte("cli-harness-window:" + seed))
+	b := []byte(hex.EncodeToString(sum[:16]))
+	b[12] = '7' // UUID 版本位（v7）
+	if b[16] < '8' {
+		b[16] = 'a' // variant 位（10xx）
 	}
-	if n > 0 {
-		return n - 1
-	}
-	return 0
-}
-
-// deriveContextWindowID 按会话 ID 稳定派生带横线 UUID（同会话恒同值=同一上下文
-// 窗口，跨会话互异；官方 contextWindowId 为 UUIDv7 形态，此处在熵源上等价）。
-func deriveContextWindowID(conversationID string) string {
-	sum := sha256.Sum256([]byte("cli-harness-window:" + conversationID))
-	b := hex.EncodeToString(sum[:16])
-	return b[0:8] + "-" + b[8:12] + "-" + b[12:16] + "-" + b[16:20] + "-" + b[20:32]
+	return string(b[0:8]) + "-" + string(b[8:12]) + "-" + string(b[12:16]) + "-" + string(b[16:20]) + "-" + string(b[20:32])
 }
 
 // cliEffortExpressed 官方判据：reasoning_effort 或 reasoning.effort 为字符串

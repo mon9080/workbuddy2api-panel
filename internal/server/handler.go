@@ -915,6 +915,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = uerr.Status
 		}
 		if uerr == nil && terr != nil {
+			// 版本适配门禁的哨兵错误（ChatStreamContext 收口检查，入口检查后的
+			// 竞态窗口会走到这）：请求级语义，不罚号、不轮转、不喂连败计数。
+			if errors.Is(terr, upstream.ErrIdentityGateBlocked) {
+				st.status = http.StatusServiceUnavailable
+				lastErr = terr
+				log.Printf("WARN: [server] chat rejected by identity version gate: %v", terr)
+				writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "identity_unadapted",
+					"gateway CLI identity is not adapted to the latest official CodeBuddy CLI release; outbound is disabled until re-calibration.", "")
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// 上游超时 / 停滞：**不换号、不罚号**。
 			//
 			// 超时不是账号的问题：同一份请求换到别的号，撞上的是同一个慢上游，

@@ -14,6 +14,7 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -87,6 +88,10 @@ func (c *Client) StartIdentityVersionLoop() {
 // checkIdentityVersionSafe 带超时与 panic 防护的检查入口（后台 goroutine 里
 // 未恢复的 panic 会带走整个进程）。拉取超时走 identityCheckTimeout，不复用
 // 短 RPC 的 120s（版本元数据只有几 KB，10s 足够，快速失败快速重试）。
+//
+// 关闭开关时**清空已快照的 latest**：与「重启后从未检查」语义对齐（关闭 =
+// 版本未知 → 门禁永不拦截）。不清空会出现「热关继续拦截、重启后放行」的
+// 行为分叉（交叉审查发现 #2）。
 func (c *Client) checkIdentityVersionSafe() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -94,6 +99,9 @@ func (c *Client) checkIdentityVersionSafe() {
 		}
 	}()
 	if !c.IdentityVersionCheck.Load() {
+		c.identityVersion.mu.Lock()
+		c.identityVersion.latest = ""
+		c.identityVersion.mu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), identityCheckTimeout)
@@ -183,11 +191,15 @@ func fetchNPMLatest(ctx context.Context, hc *http.Client) (string, error) {
 }
 
 // compareVersion 比较两个纯 semver（a>b 返回 1，a<b 返回 -1，相等 0）。
-// 调用方保证输入已过 plainVersionRe；畸形输入按 0 处理（不拦截）。
+// 防御：段数不足 3 的畸形输入按相等处理（不拦截），避免 index panic
+// （当前调用面入参均过 plainVersionRe，纯防御缺口）。
 func compareVersion(a, b string) int {
 	pa := strings.Split(a, ".")
 	pb := strings.Split(b, ".")
 	for i := 0; i < 3; i++ {
+		if i >= len(pa) || i >= len(pb) {
+			return 0
+		}
 		na, _ := strconv.Atoi(pa[i])
 		nb, _ := strconv.Atoi(pb[i])
 		if na != nb {
@@ -199,3 +211,9 @@ func compareVersion(a, b string) int {
 	}
 	return 0
 }
+
+// ErrIdentityGateBlocked 版本适配门禁拒绝的哨兵错误（CLI 身份 chat 出站收口，
+// 覆盖 handler / autotask / blackcat 等全部 ChatStream 调用点——交叉审查发现：
+// 只在 handler 挡会让合成任务流量在拦截期继续以未适配指纹出站）。
+// 调用方按请求级错误处理：不罚号、不轮转、不重试。
+var ErrIdentityGateBlocked = errors.New("identity gate blocked: official CLI released an unadapted version")
