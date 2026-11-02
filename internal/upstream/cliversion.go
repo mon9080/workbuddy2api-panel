@@ -69,21 +69,36 @@ type identityVersionState struct {
 	checkedAt time.Time // 最近一次成功检查时刻（日志/诊断用）
 }
 
-// StartIdentityVersionLoop 启动后台版本检查循环（每小时一次，进程生命周期）。
-// IdentityVersionCheck 关闭时不查（latest 恒空 → 门禁永不触发，语义 =
-// 「不检查就不拦截」）。每轮结果只更新 latest 快照；拒绝决策在
-// IdentityGateBlocked 里按需求值。
+// StartIdentityVersionLoop 启动后台版本检查循环：**启动即首查**（冷启动不让
+// 门禁空转一小时）+ 每小时巡检。IdentityVersionCheck 关闭时不查（latest 恒空
+// → 门禁永不触发，语义 = 「不检查就不拦截」）。每轮结果只更新 latest 快照；
+// 拒绝决策在 IdentityGateBlocked 里按需求值。
 func (c *Client) StartIdentityVersionLoop() {
 	go func() {
+		c.checkIdentityVersionSafe() // 启动即首查（异步：不让 npm 抖动阻塞进程启动）
 		ticker := time.NewTicker(identityCheckInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			if !c.IdentityVersionCheck.Load() {
-				continue
-			}
-			c.checkIdentityVersion(context.Background())
+			c.checkIdentityVersionSafe()
 		}
 	}()
+}
+
+// checkIdentityVersionSafe 带超时与 panic 防护的检查入口（后台 goroutine 里
+// 未恢复的 panic 会带走整个进程）。拉取超时走 identityCheckTimeout，不复用
+// 短 RPC 的 120s（版本元数据只有几 KB，10s 足够，快速失败快速重试）。
+func (c *Client) checkIdentityVersionSafe() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("WARN: [upstream] identity version check panic: %v", r)
+		}
+	}()
+	if !c.IdentityVersionCheck.Load() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), identityCheckTimeout)
+	defer cancel()
+	c.checkIdentityVersion(ctx)
 }
 
 // checkIdentityVersion 拉一次 npm latest 并更新快照。失败只记日志不更新

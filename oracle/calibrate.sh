@@ -87,6 +87,24 @@ if ! grep -q "chat/completions" "$CAPTURES/requests.jsonl" 2>/dev/null; then
 fi
 log "golden 捕获完成: $CAPTURES/requests.jsonl"
 
+# 从 golden 提取官方实际运行的 node 版本（X-Stainless-Runtime-Version）：
+# 钉扎值必须等于校准运行所用 node——CI runner 的 node 小版本与本仓库常量
+# 漂移时，oracle diff 的全等断言会假失败，这里在 bump 时一并对齐。
+NODE_VER=$(node -e "
+const fs=require('fs');
+const lines=fs.readFileSync('$CAPTURES/requests.jsonl','utf8').trim().split('\n');
+for (const l of lines) {
+  try { const e=JSON.parse(l);
+    if (e.url && e.url.includes('chat/completions') && e.headers && e.headers['x-stainless-runtime-version']) {
+      process.stdout.write(e.headers['x-stainless-runtime-version']); break; } } catch {}
+}
+")
+if ! [[ "$NODE_VER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  log "无法从 golden 提取 x-stainless-runtime-version（$NODE_VER）—— 需人工核查"
+  exit 3
+fi
+log "校准运行 node 版本=$NODE_VER"
+
 # ---------- 5. Go oracle 比对 ----------
 cd "$REPO_DIR"
 if ! WB2A_ORACLE_GOLDEN="$CAPTURES/requests.jsonl" go test ./internal/upstream/ -run TestOracleGoldenDiff -v; then
@@ -98,7 +116,8 @@ fi
 # ---------- 6. bump 版本常量 ----------
 sed -i "s/VerifiedCLIVersion = \"[^\"]*\"/VerifiedCLIVersion = \"$LATEST\"/" internal/upstream/cliversion.go
 sed -i "s/VerifiedSDKVersion = \"[^\"]*\"/VerifiedSDKVersion = \"$SDK\"/" internal/upstream/cliversion.go
-log "✅ 校准通过：VerifiedCLIVersion=$LATEST VerifiedSDKVersion=$SDK"
+sed -i "s/VerifiedNodeVersion = \"[^\"]*\"/VerifiedNodeVersion = \"$NODE_VER\"/" internal/upstream/cliversion.go
+log "✅ 校准通过：VerifiedCLIVersion=$LATEST VerifiedSDKVersion=$SDK VerifiedNodeVersion=$NODE_VER"
 
 if [ "$CI_MODE" = "--ci" ]; then
   git config user.name  "oracle-bot"

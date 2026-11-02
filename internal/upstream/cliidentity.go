@@ -26,7 +26,6 @@ import (
 	"runtime"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 // identityCLI / identityDesktop chat_identity 配置值。
@@ -162,23 +161,24 @@ func (c *Client) injectCLIAttribution(req *http.Request, a *auth.Auth) {
 // parentspanID=16hex；b3 = `<trace>-<span>-1-<parent>`；traceparent =
 // `00-<trace>-<span>-01`；baggage = `codebuddy.session_id=<conversationID>,
 // codebuddy.conversation_request_id=<requestID>`。
-func (c *Client) injectCLITraceHeaders(req *http.Request, meta ChatMeta) {
-	convReqID := meta.ConversationRequestID
-	if convReqID == "" {
-		convReqID = session.NewMessageID()
-	}
+//
+// conversationID/requestID 一律取 injectConversationHeaders 落到请求头上的
+// **生效值**（含空值兜底），保证 baggage 与 X-Conversation-ID 头一致——
+// 不读 meta 原始值（可能为空，与兜底头分叉）。
+func (c *Client) injectCLITraceHeaders(req *http.Request) {
+	convReqID := req.Header.Get("X-Conversation-Request-ID")
 	traceID := convReqID
 	if !validTraceID(traceID) {
-		traceID = session.NewMessageID()
+		traceID = req.Header.Get("X-Conversation-Message-ID")
 	}
 	// span 用 traceID 派生（同一轮对话内稳定，与官方「一次 user send 一个 span」
-	// 语义一致）；parent 用 conversationID 派生（上游轮次的稳定父跨度）。
+	// 语义一致）；parent 用会话 ID 派生（上游轮次的稳定父跨度）。
 	spanID := deriveSpanID(traceID, "span")
-	parentID := deriveSpanID(meta.ConversationID, "parent")
+	parentID := deriveSpanID(req.Header.Get("X-Conversation-ID"), "parent")
 	req.Header.Set("X-B3-ParentSpanId", parentID)
 	req.Header.Set("B3", traceID+"-"+spanID+"-1-"+parentID)
 	req.Header.Set("Traceparent", "00-"+traceID+"-"+spanID+"-01")
-	req.Header.Set("Baggage", "codebuddy.session_id="+meta.ConversationID+
+	req.Header.Set("Baggage", "codebuddy.session_id="+req.Header.Get("X-Conversation-ID")+
 		",codebuddy.conversation_request_id="+convReqID)
 }
 
@@ -220,7 +220,7 @@ func (c *Client) cliChatHeaders(req *http.Request, a *auth.Auth, clientIP string
 	c.injectStainlessHeaders(req)
 	c.injectClientIP(req, clientIP)
 	c.injectConversationHeaders(req, meta)
-	c.injectCLITraceHeaders(req, meta)
+	c.injectCLITraceHeaders(req)
 }
 
 // gzipCLIBody gzip 压缩 chat 请求体（官方 CLI 生产形态恒压缩，无体积阈值——
