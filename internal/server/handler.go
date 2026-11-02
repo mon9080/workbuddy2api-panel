@@ -611,6 +611,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CLI 身份版本适配门禁（fail-closed，2026-11-02 身份改造）：官方 npm 已发布
+	// 未适配新版时拒绝 chat 出站。网关级拒绝——不选号、不罚号、不轮转（与账号
+	// 无关，轮转只会烧健康号配额）。desktop 身份不适用门禁（无公开版本源）。
+	if blocked, detail := h.cfg.Upstream.IdentityGateBlocked(); blocked {
+		log.Printf("WARN: [server] chat rejected by identity version gate: %s", detail)
+		writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "identity_unadapted",
+			"gateway CLI identity is not adapted to the latest official CodeBuddy CLI release; outbound is disabled until re-calibration. "+detail, "")
+		st.status = http.StatusServiceUnavailable
+		st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
+
 	tried := map[string]bool{}
 	var lastErr error
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。

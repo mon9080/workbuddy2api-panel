@@ -1,0 +1,55 @@
+name: oracle-daily
+# 每日 CLI 身份校准（设计 §3.1 自动适配闭环）：
+#   diff 空 → 自动 bump verified 版本常量并推送（自动适配最新版）
+#   diff 非空 → 作业失败 + 开 issue 报警（生产门禁继续拦截，等人工适配）
+on:
+  schedule:
+    - cron: "0 19 * * *" # UTC 19:00 = 北京 03:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run calibration
+        run: bash oracle/calibrate.sh --ci
+        env:
+          GOPROXY: https://goproxy.cn,direct
+
+      - name: Open drift issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = process.env.GITHUB_RUN_ID;
+            const repo = process.env.GITHUB_REPOSITORY;
+            await github.rest.issues.create({
+              owner: repo.split('/')[0],
+              repo: repo.split('/')[1],
+              title: `oracle 校准失败：官方 CLI 出站形态漂移（run ${run}）`,
+              labels: ['identity-drift'],
+              body: [
+                '每日 oracle 校准未通过：新版官方 CLI 的出站请求与当前实现存在字段漂移。',
+                '',
+                '**生产影响**：版本适配门禁（identity_strict_gate）会持续拒绝 CLI 身份 chat 出站，直到适配完成。',
+                '',
+                '排查步骤：',
+                `1. 查看运行日志：https://github.com/${repo}/actions/runs/${run}`,
+                '2. 本地复现：`bash oracle/calibrate.sh`（diff 详情在 TestOracleGoldenDiff 输出）',
+                '3. 按 diff 修改 `internal/upstream/cliidentity.go` 后重跑校准',
+              ].join('\n'),
+            });

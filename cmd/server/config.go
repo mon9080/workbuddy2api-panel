@@ -167,6 +167,21 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// ChatIdentity chat 出站身份族："cli"（默认，CodeBuddy CLI 形态，对齐官方
+		// golden）或 "desktop"（WorkBuddy 桌面端形态，改造前行为）。装配期生效，
+		// 修改需重启（与 user_agent 同口径）。
+		ChatIdentity string `json:"chat_identity"`
+		// IdentityStrictGate 版本适配门禁（默认 true）：npm latest 出现未适配新版时
+		// 拒绝 CLI 身份 chat 出站（fail-closed）。false 降级为仅告警放行。可热改。
+		IdentityStrictGate bool `json:"identity_strict_gate"`
+		// IdentityVersionCheck 后台 npm 版本检查（默认 true）。关闭时版本未知，
+		// 门禁永不触发。可热改。
+		IdentityVersionCheck bool `json:"identity_version_check"`
+		// IdentityOS / IdentityArch / IdentityNode x-stainless 环境字段显式覆盖
+		//（逃生舱）。默认空 = 真实容器值（Linux/x64）+ 钉扎 node 版本，不伪装。
+		IdentityOS   string `json:"identity_os"`
+		IdentityArch string `json:"identity_arch"`
+		IdentityNode string `json:"identity_node"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -310,6 +325,11 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	// CLI 身份默认值（2026-11-02 身份改造）：chat 走 CodeBuddy CLI 形态；
+	// 版本适配门禁与后台检查默认开（fail-closed 是设计语义，显式配 false 才放行）。
+	c.Upstream.ChatIdentity = "cli"
+	c.Upstream.IdentityStrictGate = true
+	c.Upstream.IdentityVersionCheck = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.Strategy = pool.RegionStrategies{Domestic: pool.WeightedRandom, International: pool.WeightedRandom}
 	c.Pool.MaxInFlight = 3
@@ -468,6 +488,28 @@ func applyEnv(c *Config) {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Upstream.PassthroughIP = b
 		}
+	}
+	if v := os.Getenv("WB2A_CHAT_IDENTITY"); v != "" {
+		c.Upstream.ChatIdentity = v
+	}
+	if v := os.Getenv("WB2A_IDENTITY_STRICT_GATE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.IdentityStrictGate = b
+		}
+	}
+	if v := os.Getenv("WB2A_IDENTITY_VERSION_CHECK"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.IdentityVersionCheck = b
+		}
+	}
+	if v := os.Getenv("WB2A_IDENTITY_OS"); v != "" {
+		c.Upstream.IdentityOS = v
+	}
+	if v := os.Getenv("WB2A_IDENTITY_ARCH"); v != "" {
+		c.Upstream.IdentityArch = v
+	}
+	if v := os.Getenv("WB2A_IDENTITY_NODE"); v != "" {
+		c.Upstream.IdentityNode = v
 	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {

@@ -735,6 +735,30 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// ChatIdentity chat 出站身份族："cli"（默认，CodeBuddy CLI 形态，见
+	// cliidentity.go）或 "desktop"（WorkBuddy 桌面端形态，零回归兼容）。
+	// 任务上报/billing/refresh 路径不随本开关切换（桌面端任务指纹是上游任务
+	// 点亮规则的一部分）。账号级 product 覆盖为预留字段，本期不实现。
+	ChatIdentity string
+
+	// IdentityStrictGate 版本适配门禁（默认 true；false 降级为仅告警放行）。
+	// npm latest 出现未适配新版时拒绝 CLI 身份 chat 出站（见 cliversion.go）。
+	// 面板热改，atomic 消除数据竞争。
+	IdentityStrictGate atomic.Bool
+
+	// IdentityVersionCheck 是否启用后台 npm 版本检查（默认 true；false 时
+	// latest 恒未知，门禁永不触发）。面板热改。
+	IdentityVersionCheck atomic.Bool
+
+	// IdentityOS / IdentityArch / IdentityNode x-stainless 环境字段显式覆盖
+	//（逃生舱；默认空 = 真实容器值 + 钉扎 node 版本，不伪装）。
+	IdentityOS   string
+	IdentityArch string
+	IdentityNode string
+
+	// identityVersion 版本门禁共享状态（latest 快照），见 cliversion.go。
+	identityVersion identityVersionState
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
@@ -1216,6 +1240,17 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	// CLI 身份：body 字段对齐（cache_retention/verbosity/reasoning_summary +
+	// 剔除 Responses 专属字段，见 cliidentity.go）+ gzip 压缩（官方生产形态恒压）。
+	// 桌面端身份 body 路径零回归（不压缩、不加字段）。
+	cliGzipped := false
+	if c.cliIdentity() {
+		prepared = applyCLIBodyFields(prepared)
+		if gz, ok := gzipCLIBody(prepared); ok {
+			prepared = gz
+			cliGzipped = true
+		}
+	}
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1226,6 +1261,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			return nil, 0, nil, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
+		if cliGzipped {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)

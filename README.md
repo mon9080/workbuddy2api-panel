@@ -401,6 +401,10 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
+| `upstream.chat_identity` | `cli` | chat 出站身份族：`cli` = CodeBuddy CLI 形态（对齐官方 npm 包实测 golden，见「CLI 出站身份与版本适配门禁」）；`desktop` = WorkBuddy 桌面端形态（改造前行为）。改动需重启 |
+| `upstream.identity_strict_gate` | `true` | 版本适配门禁（fail-closed）：npm latest 出现未适配新版时拒绝 CLI 身份 chat 出站（503 `identity_unadapted` + 日志指引）；`false` 降级为仅告警放行。面板热生效 |
+| `upstream.identity_version_check` | `true` | 后台每小时检查官方 npm latest（只认 `latest` dist-tag 纯 semver，dev/next 通道拒收）；关闭则版本未知、门禁永不触发。面板热生效 |
+| `upstream.identity_os` / `identity_arch` / `identity_node` | 空 | `x-stainless-*` 环境字段显式覆盖（逃生舱）；默认 = 真实容器值（Linux/x64）+ 钉扎 node 版本，**不伪装** |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
@@ -442,7 +446,13 @@ curl -s http://localhost:7863/v1/search/messages \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_CHAT_IDENTITY` · `WB2A_IDENTITY_STRICT_GATE`(bool) · `WB2A_IDENTITY_VERSION_CHECK`(bool) · `WB2A_IDENTITY_OS` · `WB2A_IDENTITY_ARCH` · `WB2A_IDENTITY_NODE`
+
+### CLI 出站身份与版本适配门禁
+
+chat 出站默认走 **CodeBuddy CLI 身份族**（`upstream.chat_identity: cli`）：UA `CLI/<ver> CodeBuddy/<ver>`、`x-ide-*`/`x-agent-*`/`x-private-data` 归因头、`x-stainless-*` SDK 指纹（os/arch 取真实容器值，不伪装）、`b3`/`traceparent`/`baggage` 链路头、gzip 紧凑请求体、`cache_retention`/`verbosity`/`reasoning_summary` 字段对齐；桌面端/浏览器专属头（Origin/Referer/X-Machine-ID/X-Session-ID 等）一律不发。指纹证据与比对实现见 `internal/upstream/cliidentity.go` 与 `oracle/`（对官方 npm 包 mock 驱动捕获 golden 逐头 diff）。
+
+**版本适配门禁（fail-closed）**：官方 CLI 约每日发版。版本指纹（`VerifiedCLIVersion`/`VerifiedSDKVersion`）随代码钉扎，只经 oracle 校准升级——`oracle-daily` Action 每日用官方新版重捕 golden 并与本实现比对：diff 为空自动 bump 版本常量并提交（自动适配）；diff 非空则不 bump、开 issue 报警，生产侧门禁同步拒绝 CLI 身份 chat 出站（503 `identity_unadapted`，不选号不罚号），直到人工按漂移字段适配。npm 拉取失败只告警不拦截（不因网关自身网络故障停服）。桌面端任务上报/签到/余额路径不随身份开关切换，也不适用门禁（无公开版本源）。
 
 ## 核心行为语义
 

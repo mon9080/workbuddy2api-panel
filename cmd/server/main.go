@@ -162,6 +162,16 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// CLI 身份族（2026-11-02 身份改造）：chat_identity 默认 cli（CodeBuddy CLI
+	// golden 形态）；装配期生效（与 user_agent 同口径，改后需重启）。版本适配
+	// 门禁与后台 npm 检查为 atomic 热改。
+	up.ChatIdentity = cfg.Upstream.ChatIdentity
+	up.IdentityOS = cfg.Upstream.IdentityOS
+	up.IdentityArch = cfg.Upstream.IdentityArch
+	up.IdentityNode = cfg.Upstream.IdentityNode
+	up.IdentityStrictGate.Store(cfg.Upstream.IdentityStrictGate)
+	up.IdentityVersionCheck.Store(cfg.Upstream.IdentityVersionCheck)
+	up.StartIdentityVersionLoop()
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
@@ -527,6 +537,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	// 身份门禁热改：strict gate 与后台检查即时生效；chat_identity/环境覆盖值
+	// 仍走装配期（改后需重启，见装配处注释）。
+	up.IdentityStrictGate.Store(newCfg.Upstream.IdentityStrictGate)
+	up.IdentityVersionCheck.Store(newCfg.Upstream.IdentityVersionCheck)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

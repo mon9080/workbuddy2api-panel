@@ -195,7 +195,15 @@ type ChatMeta struct {
 // clientIP 为本次请求的客户端 IP（按参数传递，不读共享字段——避免并发串扰）；
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
 // meta 为会话头族元数据（纯新增，不改既有头），见 injectConversationHeaders。
+//
+// 身份分族（chat_identity，默认 cli）：CLI 身份整族切换到 cliChatHeaders
+// （golden 对齐的 CLI 头族，不含桌面端 Origin/Referer/Machine/Session 等头）；
+// desktop 身份保持既有桌面端形态（零回归）。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
+	if c.cliIdentity() {
+		c.cliChatHeaders(req, a, clientIP, meta)
+		return
+	}
 	c.CommonHeaders(req, a)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
