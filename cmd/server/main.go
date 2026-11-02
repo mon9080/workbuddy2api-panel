@@ -553,9 +553,13 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	// 身份门禁热改：strict gate 与后台检查即时生效；chat_identity/环境覆盖值
-	// 仍走装配期（改后需重启，见装配处注释）。
+	// 仍走装配期（改后需重启，见装配处注释）。热关检查时**立即清空 latest 快照**
+	// ——不等下一小时巡检（否则已触发的门禁在热关后最长继续拦截约一小时）。
 	up.IdentityStrictGate.Store(newCfg.Upstream.IdentityStrictGate)
 	up.IdentityVersionCheck.Store(newCfg.Upstream.IdentityVersionCheck)
+	if !newCfg.Upstream.IdentityVersionCheck {
+		up.ClearIdentityLatestSnapshot()
+	}
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

@@ -322,10 +322,12 @@ func applyCLIBodyFields(body []byte, conversationID, uid string) []byte {
 }
 
 // cliHarnessMetadata 官方 extra_vars.harnessMetadata 的结构（序列化为字符串嵌入）。
-// StepIndex 恒 0：官方 allocateHarnessStep 按 conversationRequestId 键控计数——
-// **新一轮对话重置为 0**，轮内的 harness step（tool 循环的每次模型调用）才递增
-// （指纹审查 B-2，官方源码 @10357146）。网关转译的每个请求都是「一轮的首个模型
-// 调用」（tool 循环不经网关），恒 0 才是主路径形态。
+// StepIndex 语义（官方 allocateHarnessStep @10356944 实证）：同一 conversationRequestId
+// 内每次模型调用递增，新 requestId 归零。网关的 X-Conversation-Request-ID 按「最后
+// 一条 user 消息」派生（handler #170 轮级键），tool 循环续发复用同一 requestId——
+// 官方计数器为 1、2…，网关按「最后一条 user 消息之后的 assistant 消息数」推导同值
+// （codex 交叉审查 #3）。官方 stepIndex≥1 还附 previous.conversationMessageId——上游
+// 消息 ID 不随流返回、网关无从得知，省略（已知残差，见 oracle/README）。
 type cliHarnessMetadata struct {
 	SchemaVersion   int    `json:"schemaVersion"`
 	HarnessVersion  string `json:"harnessVersion"`
@@ -342,7 +344,7 @@ func cliHarnessExtraVars(obj map[string]any, conversationID, uid string) map[str
 	meta := cliHarnessMetadata{
 		SchemaVersion:   1,
 		HarnessVersion:  VerifiedCLIVersion,
-		StepIndex:       0,
+		StepIndex:       assistantCallsSinceLastUser(obj),
 		ContextWindowID: deriveContextWindowID(conversationID, uid),
 	}
 	meta.Agent.Depth = 0
@@ -362,6 +364,30 @@ func cliHarnessExtraVars(obj map[string]any, conversationID, uid string) map[str
 // v7 的时间戳前缀与「同会话稳定」不可兼得，取舍为形态对齐 + 会话稳定）。
 // conversationID 为空时掺入 uid 隔离（跨账号绝不共享窗口——共享即跨账号关联
 // 指纹，与 X-Machine-ID 按 uid 派生的防关联哲学同向）。
+// assistantCallsSinceLastUser 官方 harness step 计数器的历史推导：最后一条 user
+// 消息之后的 assistant 消息数（每条 = 同 requestId 内一次更早的模型调用；tool 结果
+// 消息不计）。无 user 消息时按 0（无从定位轮边界，宁可低报）。
+func assistantCallsSinceLastUser(obj map[string]any) int {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return 0
+	}
+	count := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m, ok := msgs[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		switch role, _ := m["role"].(string); role {
+		case "user":
+			return count
+		case "assistant":
+			count++
+		}
+	}
+	return 0
+}
+
 func deriveContextWindowID(conversationID, uid string) string {
 	seed := conversationID
 	if strings.TrimSpace(seed) == "" {

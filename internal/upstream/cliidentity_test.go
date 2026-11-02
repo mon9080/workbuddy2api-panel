@@ -294,14 +294,20 @@ func TestApplyCLIBodyFields(t *testing.T) {
 			t.Errorf("同会话 contextWindowId 应稳定: %s", out2)
 		}
 	})
-	t.Run("stepIndex恒0-官方按轮重置", func(t *testing.T) {
-		// 官方 allocateHarnessStep 按 conversationRequestId 键控：**新一轮重置 0**，
-		// 轮内 tool 循环才递增（指纹审查 B-2）。网关每请求都是轮内首个模型调用，
-		// 多轮会话也恒 0。
-		in := `{"model":"m","messages":[{"role":"user","content":"1"},{"role":"assistant","content":"a"},{"role":"user","content":"2"},{"role":"assistant","content":"b"},{"role":"user","content":"3"}]}`
+	t.Run("stepIndex按轮内调用数推导", func(t *testing.T) {
+		// 官方 allocateHarnessStep：同 requestId 内每次模型调用递增。网关按
+		// 「最后一条 user 之后的 assistant 消息数」推导：tool 循环回放历史
+		// [user, assistant(tc), tool] → 下一次调用 stepIndex=1（官方同语义）。
+		in := `{"model":"m","messages":[{"role":"user","content":"1"},{"role":"assistant","content":"a","tool_calls":[]},{"role":"tool","content":"r"}]}`
 		out := string(applyCLIBodyFields([]byte(in), convID, "u-test"))
-		if !strings.Contains(out, `\"stepIndex\":0`) {
-			t.Errorf("多轮会话 stepIndex 应恒为 0: %s", out)
+		if !strings.Contains(out, `\"stepIndex\":1`) {
+			t.Errorf("tool 循环续发 stepIndex 应为 1: %s", out)
+		}
+		// 新一轮（末尾是 user）：归零。
+		in2 := `{"model":"m","messages":[{"role":"user","content":"1"},{"role":"assistant","content":"a"},{"role":"user","content":"2"}]}`
+		out2 := string(applyCLIBodyFields([]byte(in2), convID, "u-test"))
+		if !strings.Contains(out2, `\"stepIndex\":0`) {
+			t.Errorf("新轮首呼 stepIndex 应为 0: %s", out2)
 		}
 	})
 	t.Run("effort已表达时补reasoning_summary", func(t *testing.T) {

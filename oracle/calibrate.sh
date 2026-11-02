@@ -16,7 +16,9 @@ ORACLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$ORACLE_DIR")"
 WORK="$ORACLE_DIR/.work"          # 下载/解包工作区（收尾清理）
 ARCHIVE="$ORACLE_DIR/.archive"    # tarball 归档（保留最近 2）
-CAPTURES="$WORK/captures"
+# 每次运行独立捕获目录（codex 交叉审查 #4：并发校准时第二个 mock 会先清空
+# 第一个的 golden 再撞端口——按 PID 隔离目录 + 随机端口探测空闲后使用）。
+CAPTURES="$WORK/captures-$$"
 mkdir -p "$WORK" "$ARCHIVE" "$CAPTURES"
 
 log() { echo "[calibrate] $*"; }
@@ -62,7 +64,15 @@ fi
 log "内嵌 SDK 版本=$SDK"
 
 # ---------- 4. mock 驱动官方 CLI ----------
-PORT=18799
+# 随机端口 + 就绪探测（就绪失败换口重试三次；避免固定端口的并发冲突）。
+PORT=""
+for _ in $(seq 1 3); do
+  CAND=$((18800 + RANDOM % 1000))
+  if node -e "const n=require('net');const s=n.connect($CAND,'127.0.0.1');s.on('error',()=>process.exit(0));s.on('connect',()=>{s.destroy();process.exit(1)})"; then
+    PORT=$CAND; break
+  fi
+done
+if [ -z "$PORT" ]; then PORT=18799; fi
 node "$ORACLE_DIR/mock-upstream.js" "$PORT" "$CAPTURES" &
 MOCK_PID=$!
 trap 'kill $MOCK_PID 2>/dev/null || true' EXIT
@@ -151,8 +161,10 @@ cleanup() {
     freed=$((freed + $(du -k "$f" | cut -f1)))
     rm -f "$f"; log "清理旧归档: $f"
   done
-  # 解包目录全清（需要时可从归档 tarball 秒级恢复）
+  # 解包目录全清（需要时可从归档 tarball 秒级恢复）；历史 per-run 捕获目录一并清
+  #（当前 run 的留在原处供排查，下次校准收尾时被清）。
   rm -rf "$PKG"
+  find "$WORK" -maxdepth 1 -type d -name 'captures-*' ! -path "$CAPTURES" -exec rm -rf {} + 2>/dev/null || true
   log "清理完成（解包目录已删，归档保留最近 2 版）"
 }
 cleanup

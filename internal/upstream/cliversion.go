@@ -138,6 +138,15 @@ const identityGateHint = "等待每日 oracle 校准 Action 自动 bump verified
 // 任一不满足即放行：desktop 身份无公开版本源不适用门禁；strict 关 = 用户显式
 // 选择了「告警放行」；latest 空 = 从未成功检查（不因自身网络故障停服）；
 // latest 旧于等于 verified = 已适配（npm 回退/同版不拦截）。
+// ClearIdentityLatestSnapshot 清空已快照的 npm latest（热关闭 identity_version_check
+// 时由面板保存路径调用，codex 交叉审查 #2：不等下一小时巡检——否则已触发的门禁
+// 在热关后最长继续拦截约一小时，违背「关闭 = 版本未知、门禁永不触发」的配置承诺）。
+func (c *Client) ClearIdentityLatestSnapshot() {
+	c.identityVersion.mu.Lock()
+	c.identityVersion.latest = ""
+	c.identityVersion.mu.Unlock()
+}
+
 func (c *Client) IdentityGateBlocked() (bool, string) {
 	if c == nil || c.chatIdentityOf() != identityCLI {
 		return false, ""
