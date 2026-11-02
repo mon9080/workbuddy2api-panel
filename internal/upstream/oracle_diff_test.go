@@ -166,6 +166,34 @@ func TestOracleGoldenDiff(t *testing.T) {
 			t.Errorf("body 应剔除 %s", banned)
 		}
 	}
+	// extra_vars：官方恒发，本实现按自洽会话语义派生（presence + shape 断言，
+	// 值本身随会话派生不做全等比对）。
+	ev, ok := payload["extra_vars"].(map[string]any)
+	if !ok {
+		t.Fatalf("body 缺 extra_vars（官方 CLI 恒发，缺失即指纹差异）: %v", payload["extra_vars"])
+	}
+	if ev["initiator"] != "user" || ev["interactionType"] != "prompt" {
+		t.Errorf("extra_vars 静态字段与官方不符: %v", ev)
+	}
+	hmStr, ok := ev["harnessMetadata"].(string)
+	if !ok {
+		t.Fatalf("harnessMetadata 应为字符串化 JSON（官方形态）: %T", ev["harnessMetadata"])
+	}
+	var hm struct {
+		SchemaVersion   int    `json:"schemaVersion"`
+		HarnessVersion  string `json:"harnessVersion"`
+		StepIndex       int    `json:"stepIndex"`
+		ContextWindowID string `json:"contextWindowId"`
+	}
+	if err := json.Unmarshal([]byte(hmStr), &hm); err != nil {
+		t.Fatalf("harnessMetadata 解析失败: %v (%s)", err, hmStr)
+	}
+	if hm.SchemaVersion != 1 || hm.HarnessVersion != VerifiedCLIVersion {
+		t.Errorf("harnessMetadata 版本字段漂移: %+v", hm)
+	}
+	if !strings.Contains(hm.ContextWindowID, "-") || len(hm.ContextWindowID) != 36 {
+		t.Errorf("contextWindowId 非带横线 UUID 形态: %q", hm.ContextWindowID)
+	}
 }
 
 // headerGet 大小写不敏感取头（捕获 JSON 的键为小写，Go http.Header canonical 化）。

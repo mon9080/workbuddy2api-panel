@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"compress/gzip"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -238,9 +239,10 @@ func TestDesktopChatHeadersUnchanged(t *testing.T) {
 }
 
 func TestApplyCLIBodyFields(t *testing.T) {
+	convID := "01a19c44-90ad-7bc5-9891-a80d2fe34e7a"
 	t.Run("补默认字段并剔除Responses专属字段", func(t *testing.T) {
 		in := `{"model":"m","messages":[{"role":"user","content":"hi"}],"metadata":{"a":1},"conversation_id":"c1","previous_response_id":"p1"}`
-		out := applyCLIBodyFields([]byte(in))
+		out := applyCLIBodyFields([]byte(in), convID)
 		for _, want := range []string{`"cache_retention":"long"`, `"verbosity":"high"`} {
 			if !strings.Contains(string(out), want) {
 				t.Errorf("body 缺 %s: %s", want, out)
@@ -252,47 +254,90 @@ func TestApplyCLIBodyFields(t *testing.T) {
 			}
 		}
 	})
+	t.Run("extra_vars自洽派生", func(t *testing.T) {
+		// 首轮（1 条 user 消息）：stepIndex=0，对齐官方 golden。
+		in := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+		out := applyCLIBodyFields([]byte(in), convID)
+		var obj map[string]any
+		if err := json.Unmarshal(out, &obj); err != nil {
+			t.Fatalf("解析失败: %v", err)
+		}
+		ev, ok := obj["extra_vars"].(map[string]any)
+		if !ok {
+			t.Fatalf("extra_vars 缺失: %s", out)
+		}
+		if ev["initiator"] != "user" || ev["interactionType"] != "prompt" {
+			t.Errorf("extra_vars 静态字段错误: %v", ev)
+		}
+		hm, ok := ev["harnessMetadata"].(string)
+		if !ok {
+			t.Fatalf("harnessMetadata 应为字符串化 JSON: %v", ev["harnessMetadata"])
+		}
+		var meta struct {
+			SchemaVersion   int    `json:"schemaVersion"`
+			HarnessVersion  string `json:"harnessVersion"`
+			StepIndex       int    `json:"stepIndex"`
+			ContextWindowID string `json:"contextWindowId"`
+		}
+		if err := json.Unmarshal([]byte(hm), &meta); err != nil {
+			t.Fatalf("harnessMetadata 解析失败: %v (%s)", err, hm)
+		}
+		if meta.SchemaVersion != 1 || meta.HarnessVersion != VerifiedCLIVersion || meta.StepIndex != 0 {
+			t.Errorf("harnessMetadata 首轮值错误: %+v", meta)
+		}
+		// contextWindowId 带横线 UUID 形态，且同会话稳定派生。
+		if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(meta.ContextWindowID) {
+			t.Errorf("contextWindowId 非 UUID 形态: %q", meta.ContextWindowID)
+		}
+		out2 := applyCLIBodyFields([]byte(in), convID)
+		if !strings.Contains(string(out2), meta.ContextWindowID) {
+			t.Errorf("同会话 contextWindowId 应稳定: %s", out2)
+		}
+	})
+	t.Run("stepIndex随轮次增长", func(t *testing.T) {
+		// 3 条 user 消息 = 已完成 2 轮。harnessMetadata 是字符串化 JSON，
+		// 断言按转义后形态匹配。
+		in := `{"model":"m","messages":[{"role":"user","content":"1"},{"role":"assistant","content":"a"},{"role":"user","content":"2"},{"role":"assistant","content":"b"},{"role":"user","content":"3"}]}`
+		out := string(applyCLIBodyFields([]byte(in), convID))
+		if !strings.Contains(out, `\"stepIndex\":2`) {
+			t.Errorf("3 轮会话 stepIndex 应为 2: %s", out)
+		}
+	})
 	t.Run("effort已表达时补reasoning_summary", func(t *testing.T) {
 		for _, body := range []string{
 			`{"model":"m","reasoning_effort":"high"}`,
 			`{"model":"m","reasoningEffort":"low"}`,
 			`{"model":"m","reasoning":{"effort":"low"}}`,
 		} {
-			out := string(applyCLIBodyFields([]byte(body)))
+			out := string(applyCLIBodyFields([]byte(body), convID))
 			if !strings.Contains(out, `"reasoning_summary":"auto"`) {
 				t.Errorf("effort 表达后应补 reasoning_summary: %s → %s", body, out)
 			}
 		}
 	})
 	t.Run("effort未表达不补summary", func(t *testing.T) {
-		out := string(applyCLIBodyFields([]byte(`{"model":"m","messages":[]}`)))
+		out := string(applyCLIBodyFields([]byte(`{"model":"m","messages":[]}`), convID))
 		if strings.Contains(out, "reasoning_summary") {
 			t.Errorf("effort 缺失不应补 reasoning_summary: %s", out)
 		}
 		// 非字符串形态（数字/null）不算表达（官方 typeof === "string" 判据）。
-		out = string(applyCLIBodyFields([]byte(`{"model":"m","reasoning_effort":3,"reasoning":{"effort":null}}`)))
+		out = string(applyCLIBodyFields([]byte(`{"model":"m","reasoning_effort":3,"reasoning":{"effort":null}}`), convID))
 		if strings.Contains(out, "reasoning_summary") {
 			t.Errorf("非字符串 effort 不应补 reasoning_summary: %s", out)
 		}
 	})
 	t.Run("显式值不覆盖", func(t *testing.T) {
-		out := string(applyCLIBodyFields([]byte(`{"model":"m","cache_retention":"short","verbosity":"low","reasoning_summary":"off","reasoning_effort":"high"}`)))
-		for _, keep := range []string{`"cache_retention":"short"`, `"verbosity":"low"`, `"reasoning_summary":"off"`} {
+		out := string(applyCLIBodyFields([]byte(`{"model":"m","cache_retention":"short","verbosity":"low","reasoning_summary":"off","reasoning_effort":"high","extra_vars":{"x":1}}`), convID))
+		for _, keep := range []string{`"cache_retention":"short"`, `"verbosity":"low"`, `"reasoning_summary":"off"`, `"x":1`} {
 			if !strings.Contains(out, keep) {
-				t.Errorf("显式值被覆盖: %s → %s 期望保留 %s", out, "", keep)
+				t.Errorf("显式值被覆盖（期望保留 %s）: %s", keep, out)
 			}
 		}
 	})
 	t.Run("坏body原样返回", func(t *testing.T) {
 		in := []byte("{not json")
-		if out := applyCLIBodyFields(in); string(out) != string(in) {
+		if out := applyCLIBodyFields(in, convID); string(out) != string(in) {
 			t.Errorf("坏 body 应原样返回: %s", out)
-		}
-	})
-	t.Run("extra_vars不注入", func(t *testing.T) {
-		out := string(applyCLIBodyFields([]byte(`{"model":"m"}`)))
-		if strings.Contains(out, "extra_vars") {
-			t.Errorf("extra_vars 是官方 agent 运行时元数据，不应伪造: %s", out)
 		}
 	})
 }

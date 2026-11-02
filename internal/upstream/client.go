@@ -1245,7 +1245,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 桌面端身份 body 路径零回归（不压缩、不加字段）。
 	cliGzipped := false
 	if c.cliIdentity() {
-		prepared = applyCLIBodyFields(prepared)
+		prepared = applyCLIBodyFields(prepared, meta.ConversationID)
 		if gz, ok := gzipCLIBody(prepared); ok {
 			prepared = gz
 			cliGzipped = true

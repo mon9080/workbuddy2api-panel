@@ -244,14 +244,17 @@ func gzipCLIBody(body []byte) ([]byte, bool) {
 //   - verbosity：缺省补 "high"（官方 CLI 默认档，客户端偏好类字段，无会话状态）
 //   - reasoning_summary：思考已表达（reasoning_effort / reasoning.effort 为字符串）
 //     且未显式携带时补 "auto"（官方 injectReasoningSummaryIfNeeded）
+//   - extra_vars：按官方 agent 会话语义**自洽派生**（不静态伪造）——
+//     harnessMetadata（字符串化 JSON）取真实 CLI 首轮/多轮形态：
+//     schemaVersion=1、harnessVersion=已适配 CLI 版本、stepIndex=会话内已完成的
+//     用户轮次数（user 消息数-1，CLI 的 step 语义）、contextWindowId=按会话 ID
+//     稳定派生的带横线 UUID（同会话同窗口，跨会话互异）、agent.depth=0；
+//     initiator="user"、interactionType="prompt"（官方主对话恒定值）
 //   - 剔除 metadata / conversation_id / previous_response_id（Responses API 与
 //     客户端自定义字段，官方 CLI chat 路径不发）
 //
-// 不做的事：extra_vars / messages[].agent / messages[].conversationRequestId 是
-// 官方 CLI 的 agent 运行时元数据（harnessMetadata/contextWindowId/stepIndex 等
-// 会话状态），网关无从得知也无从伪造——伪造含虚构会话状态的字段比缺省更易被
-// 识别，故不注入。
-func applyCLIBodyFields(body []byte) []byte {
+// 所有字段均为缺省注入（客户端已写不覆盖）。
+func applyCLIBodyFields(body []byte, conversationID string) []byte {
 	if len(body) == 0 {
 		return body
 	}
@@ -272,6 +275,12 @@ func applyCLIBodyFields(body []byte) []byte {
 		obj["reasoning_summary"] = "auto"
 		changed = true
 	}
+	if _, has := obj["extra_vars"]; !has {
+		if ev := cliHarnessExtraVars(obj, conversationID); ev != nil {
+			obj["extra_vars"] = ev
+			changed = true
+		}
+	}
 	for _, drop := range [...]string{"metadata", "conversation_id", "previous_response_id"} {
 		if _, has := obj[drop]; has {
 			delete(obj, drop)
@@ -286,6 +295,67 @@ func applyCLIBodyFields(body []byte) []byte {
 		return body
 	}
 	return out
+}
+
+// cliHarnessMetadata 官方 extra_vars.harnessMetadata 的结构（序列化为字符串嵌入）。
+type cliHarnessMetadata struct {
+	SchemaVersion   int    `json:"schemaVersion"`
+	HarnessVersion  string `json:"harnessVersion"`
+	StepIndex       int    `json:"stepIndex"`
+	ContextWindowID string `json:"contextWindowId"`
+	Agent           struct {
+		Depth int `json:"depth"`
+	} `json:"agent"`
+}
+
+// cliHarnessExtraVars 派生官方 CLI 形态的 extra_vars（自洽：同会话同窗口、
+// 轮次随历史增长、版本随指纹常量）。
+func cliHarnessExtraVars(obj map[string]any, conversationID string) map[string]any {
+	meta := cliHarnessMetadata{
+		SchemaVersion:   1,
+		HarnessVersion:  VerifiedCLIVersion,
+		StepIndex:       userTurnsCompleted(obj),
+		ContextWindowID: deriveContextWindowID(conversationID),
+	}
+	meta.Agent.Depth = 0
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return nil
+	}
+	return map[string]any{
+		"harnessMetadata": string(metaJSON),
+		"initiator":       "user",
+		"interactionType": "prompt",
+	}
+}
+
+// userTurnsCompleted 会话内已完成的用户轮次 = user 角色消息数 - 1（首条消息为
+// 第 0 步，对齐官方 golden 首轮 stepIndex=0）。无 messages 或解析失败按 0。
+func userTurnsCompleted(obj map[string]any) int {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return 0
+	}
+	n := 0
+	for _, raw := range msgs {
+		if m, ok := raw.(map[string]any); ok {
+			if role, _ := m["role"].(string); role == "user" {
+				n++
+			}
+		}
+	}
+	if n > 0 {
+		return n - 1
+	}
+	return 0
+}
+
+// deriveContextWindowID 按会话 ID 稳定派生带横线 UUID（同会话恒同值=同一上下文
+// 窗口，跨会话互异；官方 contextWindowId 为 UUIDv7 形态，此处在熵源上等价）。
+func deriveContextWindowID(conversationID string) string {
+	sum := sha256.Sum256([]byte("cli-harness-window:" + conversationID))
+	b := hex.EncodeToString(sum[:16])
+	return b[0:8] + "-" + b[8:12] + "-" + b[12:16] + "-" + b[16:20] + "-" + b[20:32]
 }
 
 // cliEffortExpressed 官方判据：reasoning_effort 或 reasoning.effort 为字符串
