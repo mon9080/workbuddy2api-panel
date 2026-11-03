@@ -68,6 +68,51 @@ type identityVersionState struct {
 	mu        sync.RWMutex
 	latest    string    // npm latest 已知值（空 = 未知，不拦截）
 	checkedAt time.Time // 最近一次成功检查时刻（日志/诊断用）
+
+	// verifiedCLI/verifiedSDK 运行时版本覆盖（面板「一键适配升级」写入；空 =
+	// 编译期常量 VerifiedCLIVersion/VerifiedSDKVersion）。持久化由 config 的
+	// identity_verified_cli/identity_verified_sdk 承载，重启后仍在。
+	verifiedCLI string
+	verifiedSDK string
+}
+
+// SetIdentityVerified 热覆盖生效的已适配版本（静态校准通过后调用；空串还原
+// 编译常量）。
+func (c *Client) SetIdentityVerified(cli, sdk string) {
+	c.identityVersion.mu.Lock()
+	c.identityVersion.verifiedCLI = strings.TrimSpace(cli)
+	c.identityVersion.verifiedSDK = strings.TrimSpace(sdk)
+	c.identityVersion.mu.Unlock()
+}
+
+// EffectiveCLIVersion 当前生效的已适配 CLI 版本（运行时覆盖 > 编译常量）。
+// 出站 UA / x-ide-version / harnessVersion 统一经此取值。
+func (c *Client) EffectiveCLIVersion() string {
+	c.identityVersion.mu.RLock()
+	defer c.identityVersion.mu.RUnlock()
+	if c.identityVersion.verifiedCLI != "" {
+		return c.identityVersion.verifiedCLI
+	}
+	return VerifiedCLIVersion
+}
+
+// EffectiveSDKVersion 当前生效的 x-stainless-package-version（覆盖 > 常量）。
+func (c *Client) EffectiveSDKVersion() string {
+	c.identityVersion.mu.RLock()
+	defer c.identityVersion.mu.RUnlock()
+	if c.identityVersion.verifiedSDK != "" {
+		return c.identityVersion.verifiedSDK
+	}
+	return VerifiedSDKVersion
+}
+
+// IdentityStatus 面板状态接口：npm latest / 生效版本 / 门禁态。
+func (c *Client) IdentityStatus() (latest, verified string, blocked bool) {
+	c.identityVersion.mu.RLock()
+	latest = c.identityVersion.latest
+	c.identityVersion.mu.RUnlock()
+	blocked, _ = c.IdentityGateBlocked()
+	return latest, c.EffectiveCLIVersion(), blocked
 }
 
 // StartIdentityVersionLoop 启动后台版本检查循环：**启动即首查**（冷启动不让
@@ -157,14 +202,15 @@ func (c *Client) IdentityGateBlocked() (bool, string) {
 	c.identityVersion.mu.RLock()
 	latest := c.identityVersion.latest
 	c.identityVersion.mu.RUnlock()
-	if latest == "" || latest == VerifiedCLIVersion {
+	verified := c.EffectiveCLIVersion()
+	if latest == "" || latest == verified {
 		return false, ""
 	}
-	if compareVersion(latest, VerifiedCLIVersion) <= 0 {
+	if compareVersion(latest, verified) <= 0 {
 		return false, ""
 	}
 	return true, fmt.Sprintf("官方 CLI 已发布 %s，本地已适配版本 %s，未适配新版前拒绝出站。%s",
-		latest, VerifiedCLIVersion, identityGateHint)
+		latest, verified, identityGateHint)
 }
 
 // fetchNPMLatest 拉取 npm latest dist-tag 的版本号并做纯 semver 校验。

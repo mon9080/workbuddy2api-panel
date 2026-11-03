@@ -1254,7 +1254,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			log.Printf("WARN: [upstream] chat_stream acct=%s: %s", logfmt.Label(a.UID, a.Nickname), detail)
 			return nil, 0, nil, fmt.Errorf("%w: %s", ErrIdentityGateBlocked, detail)
 		}
-		prepared = applyCLIBodyFields(prepared, meta.ConversationID, a.UID)
+		prepared = applyCLIBodyFields(prepared, meta.ConversationID, a.UID, c.EffectiveCLIVersion())
 		if gz, ok := gzipCLIBody(prepared); ok {
 			prepared = gz
 			cliGzipped = true

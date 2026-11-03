@@ -69,6 +69,11 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// PersistIdentityVersions 「一键适配升级」校准通过后的版本持久化（main 注入：
+	// 写 config 落盘 + 热生效，复用 SaveConfig 同一链路）。nil 时校准只做进程内
+	// 热覆盖（重启后回落编译常量）。
+	PersistIdentityVersions func(cli, sdk string) error
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -162,6 +167,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
+	// 身份版本状态 + 一键适配升级（静态校准，见 upstream/identitycalib.go）。
+	p.mux.HandleFunc("GET /panel/api/identity/status", p.withAuth(p.identityStatus))
+	p.mux.HandleFunc("POST /panel/api/identity/calibrate", p.withAuth(p.identityCalibrate))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
@@ -278,8 +286,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 
@@ -572,6 +580,49 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.Revive(uid)
 	log.Printf("panel: revive uid=%s（人工清除禁用/冷却/熔断）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// identityStatus CLI 身份版本状态（npm latest / 已适配版本 / 门禁态）。
+func (p *Panel) identityStatus(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Upstream == nil {
+		writeErr(w, http.StatusNotImplemented, "upstream client unavailable")
+		return
+	}
+	latest, verified, blocked := p.cfg.Upstream.IdentityStatus()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"latest":       latest,
+		"verified":     verified,
+		"gate_blocked": blocked,
+		"identity":     p.cfg.Upstream.ChatIdentity,
+	})
+}
+
+// identityCalibrate 一键适配升级：容器内静态校准（下载官方 tarball → 指纹常量
+// 核对 → 全过热覆盖生效版本并持久化；漂移则拒绝并报字段）。耗时约 1-2 分钟
+// （65MB 下载），前端按钮需带 loading 态。
+func (p *Panel) identityCalibrate(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Upstream == nil {
+		writeErr(w, http.StatusNotImplemented, "upstream client unavailable")
+		return
+	}
+	res, err := p.cfg.Upstream.RunIdentityStaticCalib()
+	if err != nil {
+		log.Printf("panel: identity calibrate failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if res.Status == "adapted" && p.cfg.PersistIdentityVersions != nil {
+		if err := p.cfg.PersistIdentityVersions(res.NewCLI, res.NewSDK); err != nil {
+			// 热覆盖已生效但落盘失败：可用但重启回退——如实上报，不静默。
+			log.Printf("ERR: panel: persist identity versions failed: %v", err)
+			res.Checks = append(res.Checks, "注意：热生效成功但配置落盘失败（重启后回退），请检查 config 写入")
+		} else {
+			res.Checks = append(res.Checks, "已写入配置持久化")
+		}
+	}
+	log.Printf("panel: identity calibrate status=%s latest=%s verified=%s->%s drift=%v",
+		res.Status, res.Latest, res.OldCLI, res.NewCLI, res.Drift)
+	writeJSON(w, http.StatusOK, res)
 }
 
 // accountDisable 人工禁用（不再参与选号，需面板 revive 或重登恢复）。

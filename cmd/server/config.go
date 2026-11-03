@@ -182,6 +182,12 @@ type Config struct {
 		IdentityOS   string `json:"identity_os"`
 		IdentityArch string `json:"identity_arch"`
 		IdentityNode string `json:"identity_node"`
+		// IdentityVerifiedCLI / IdentityVerifiedSDK 已适配版本的运行时覆盖
+		//（面板「一键适配升级」静态校准通过后写入；空 = 编译期常量）。
+		// 出站 UA / x-ide-version / x-stainless-package-version 与版本门禁
+		// 均以覆盖值为准；删除配置键即回落编译常量。
+		IdentityVerifiedCLI string `json:"identity_verified_cli"`
+		IdentityVerifiedSDK string `json:"identity_verified_sdk"`
 	} `json:"upstream"`
 
 	Features struct {

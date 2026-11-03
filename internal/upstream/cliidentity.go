@@ -55,7 +55,7 @@ func (c *Client) cliIdentity() bool {
 // 版本恒取 VerifiedCLIVersion——config 的 cli_version 是桌面端 UA 第三段的
 // 语义，不得混用到 CLI 身份（两族版本独立演进）。
 func (c *Client) cliUserAgent() string {
-	return "CLI/" + VerifiedCLIVersion + " CodeBuddy/" + VerifiedCLIVersion
+	return "CLI/" + c.EffectiveCLIVersion() + " CodeBuddy/" + c.EffectiveCLIVersion()
 }
 
 // stainlessOS X-Stainless-OS：runtime.GOOS 映射官方 normalizePlatform 值域。
@@ -125,7 +125,7 @@ func (c *Client) stainlessNodeVersion() string {
 func (c *Client) injectStainlessHeaders(req *http.Request) {
 	h := req.Header
 	h.Set("X-Stainless-Lang", "js")
-	h.Set("X-Stainless-Package-Version", VerifiedSDKVersion)
+	h.Set("X-Stainless-Package-Version", c.EffectiveSDKVersion())
 	h.Set("X-Stainless-OS", c.stainlessOS())
 	h.Set("X-Stainless-Arch", c.stainlessArch())
 	h.Set("X-Stainless-Runtime", "node")
@@ -141,7 +141,7 @@ func (c *Client) injectStainlessHeaders(req *http.Request) {
 func (c *Client) injectCLIAttribution(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-IDE-Type", "CLI")
 	req.Header.Set("X-IDE-Name", "CLI")
-	req.Header.Set("X-IDE-Version", VerifiedCLIVersion)
+	req.Header.Set("X-IDE-Version", c.EffectiveCLIVersion())
 	req.Header.Set("X-Product", "SaaS")
 	req.Header.Set("X-Agent-Intent", "craft")
 	req.Header.Set("X-Agent-Purpose", "conversation")
@@ -278,7 +278,7 @@ func gzipCLIBody(body []byte) ([]byte, bool) {
 // 所有字段均为缺省注入（客户端已写不覆盖）。conversationID 为空时（客户端
 // 未带会话标识）以 uid 参与派生——否则全部空会话请求会共享同一个
 // contextWindowId，构成跨账号可关联的常量指纹（交叉审查发现 #4）。
-func applyCLIBodyFields(body []byte, conversationID, uid string) []byte {
+func applyCLIBodyFields(body []byte, conversationID, uid, cliVersion string) []byte {
 	if len(body) == 0 {
 		return body
 	}
@@ -300,7 +300,7 @@ func applyCLIBodyFields(body []byte, conversationID, uid string) []byte {
 		changed = true
 	}
 	if _, has := obj["extra_vars"]; !has {
-		if ev := cliHarnessExtraVars(obj, conversationID, uid); ev != nil {
+		if ev := cliHarnessExtraVars(obj, conversationID, uid, cliVersion); ev != nil {
 			obj["extra_vars"] = ev
 			changed = true
 		}
@@ -340,10 +340,10 @@ type cliHarnessMetadata struct {
 
 // cliHarnessExtraVars 派生官方 CLI 形态的 extra_vars（自洽：同会话同窗口、
 // stepIndex 恒 0、版本随指纹常量）。
-func cliHarnessExtraVars(obj map[string]any, conversationID, uid string) map[string]any {
+func cliHarnessExtraVars(obj map[string]any, conversationID, uid, cliVersion string) map[string]any {
 	meta := cliHarnessMetadata{
 		SchemaVersion:   1,
-		HarnessVersion:  VerifiedCLIVersion,
+		HarnessVersion:  cliVersion,
 		StepIndex:       assistantCallsSinceLastUser(obj),
 		ContextWindowID: deriveContextWindowID(conversationID, uid),
 	}

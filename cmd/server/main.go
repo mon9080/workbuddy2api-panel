@@ -171,6 +171,8 @@ func main() {
 	up.IdentityNode = cfg.Upstream.IdentityNode
 	up.IdentityStrictGate.Store(cfg.Upstream.IdentityStrictGate)
 	up.IdentityVersionCheck.Store(cfg.Upstream.IdentityVersionCheck)
+	// 已适配版本运行时覆盖（面板一键适配写入 config；空 = 编译常量）。
+	up.SetIdentityVerified(cfg.Upstream.IdentityVerifiedCLI, cfg.Upstream.IdentityVerifiedSDK)
 	up.StartIdentityVersionLoop()
 	// 身份生效可见性（交叉审查 P2）：启动打印当前身份族与已适配版本；
 	// cli 身份下 user_agent/client_name 对 chat 路径静默失效，显式 WARN 提示。
@@ -339,6 +341,32 @@ func main() {
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
 			return saveConfig(raw, *cfgPath, live, p, up, sch)
+		},
+		// 一键适配升级的版本持久化：读盘 → 改两个键 → 复用 SaveConfig 同一链路
+		//（校验 + 落盘 + 热生效）。端点在成功后调用；失败时热覆盖已生效，
+		// 由端点如实转告「重启回退」。
+		PersistIdentityVersions: func(cli, sdk string) error {
+			raw, err := os.ReadFile(*cfgPath)
+			if err != nil {
+				return err
+			}
+			var m map[string]any
+			if err := json.Unmarshal(raw, &m); err != nil {
+				return err
+			}
+			upSection, _ := m["upstream"].(map[string]any)
+			if upSection == nil {
+				upSection = map[string]any{}
+				m["upstream"] = upSection
+			}
+			upSection["identity_verified_cli"] = cli
+			upSection["identity_verified_sdk"] = sdk
+			out, err := json.MarshalIndent(m, "", "  ")
+			if err != nil {
+				return err
+			}
+			_, err = saveConfig(out, *cfgPath, live, p, up, sch)
+			return err
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
@@ -557,6 +585,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// ——不等下一小时巡检（否则已触发的门禁在热关后最长继续拦截约一小时）。
 	up.IdentityStrictGate.Store(newCfg.Upstream.IdentityStrictGate)
 	up.IdentityVersionCheck.Store(newCfg.Upstream.IdentityVersionCheck)
+	// 已适配版本覆盖热应用（面板一键适配或手工改配置都会走这里；空值回落编译常量）。
+	up.SetIdentityVerified(newCfg.Upstream.IdentityVerifiedCLI, newCfg.Upstream.IdentityVerifiedSDK)
 	if !newCfg.Upstream.IdentityVersionCheck {
 		up.ClearIdentityLatestSnapshot()
 	}

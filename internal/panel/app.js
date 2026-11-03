@@ -1211,6 +1211,9 @@ async function loadConfig() {
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
+    // 配置页顺带渲染「CLI 身份与版本」卡片（自治；typeof 守卫兼容测试沙箱的
+    // 函数级片段求值——那里没有本函数定义）。
+    if (typeof renderIdentityCard === 'function') renderIdentityCard();
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
 function collectConfig() {
@@ -3454,3 +3457,66 @@ if ($('btnExpFold')) {
   };
 }
 applyExpFold();
+
+/* ── CLI 身份与版本（一键适配升级）──────────────────────────────────
+ * 配置页顶部的自治卡片：显示 npm latest / 已适配版本 / 门禁态；
+ * 「一键适配升级」触发容器内静态校准（下载官方 tarball → 指纹常量核对 →
+ * 全过热覆盖生效版本并持久化）。详见 oracle/ 与 internal/upstream/identitycalib.go。
+ */
+async function renderIdentityCard() {
+  try {
+    let card = $('identityCard');
+    if (!card) {
+      const form = $('cfgForm');
+      if (!form || !form.parentNode) return;
+      card = document.createElement('div');
+      card.id = 'identityCard';
+      card.style.cssText = 'border:1px solid #d8d8e0;border-radius:10px;padding:14px 16px;margin:14px 0';
+      const h = document.createElement('h3');
+      h.textContent = 'CLI 身份与版本';
+      h.style.cssText = 'margin:0 0 8px;font-size:15px';
+      const info = document.createElement('div');
+      info.id = 'identityInfo';
+      info.style.cssText = 'margin-bottom:10px;font-size:13px;line-height:1.6';
+      const btn = document.createElement('button');
+      btn.id = 'identityCalibBtn';
+      btn.type = 'button';
+      btn.textContent = '一键适配升级';
+      btn.style.cssText = 'padding:6px 14px;border-radius:8px;border:1px solid #b9b9c6;cursor:pointer';
+      btn.onclick = identityCalibrate;
+      card.appendChild(h); card.appendChild(info); card.appendChild(btn);
+      form.parentNode.insertBefore(card, form);
+    }
+    const s = await api('identity/status');
+    if (s.gate_blocked) {
+      $('identityInfo').textContent = '⚠ 官方已发布 ' + s.latest + '（已适配 ' + s.verified + '），版本门禁拦截中——点击下方按钮自动适配';
+    } else {
+      $('identityInfo').textContent = '出站身份 ' + s.identity + '｜已适配 ' + s.verified + '｜npm latest ' + (s.latest || '未知');
+    }
+  } catch (e) {
+    // 状态读取失败不静默抛出（mock DOM / 网络异常都不影响配置页其余功能）。
+    const info = $('identityInfo');
+    if (info) info.textContent = '状态读取失败：' + (e && e.message ? e.message : e);
+  }
+}
+async function identityCalibrate() {
+  const btn = $('identityCalibBtn');
+  btn.disabled = true;
+  btn.textContent = '校准中（下载官方包，约 1-2 分钟）…';
+  try {
+    const r = await api('identity/calibrate', { method: 'POST' });
+    if (r.status === 'current') {
+      toast('已是最新适配版本（' + r.latest + '），无需操作', 'ok');
+    } else if (r.status === 'adapted') {
+      toast('已适配官方 ' + r.new_cli + '（SDK ' + r.new_sdk + '），版本门禁解除', 'ok');
+    } else {
+      toast('检测到出站形态漂移，未适配：' + (r.drift || []).join('；'), 'err');
+    }
+    await renderIdentityCard();
+  } catch (e) {
+    toast('校准失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '一键适配升级';
+  }
+}
