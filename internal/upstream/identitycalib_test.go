@@ -9,6 +9,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -333,6 +334,98 @@ func TestIdentityCalibDownloadSecurity(t *testing.T) {
 		withFakeNPM(t, srv)
 		if _, err := newCLIClient().RunIdentityStaticCalib(); err == nil || !strings.Contains(err.Error(), "大小上限") {
 			t.Fatalf("超过大小上限必须拒绝, err=%v", err)
+		}
+	})
+
+	// 三审 P2：元数据请求自身的重定向也必须受源策略约束（此前只校验 dist.tarball）。
+	t.Run("元数据重定向到异源-拒绝", func(t *testing.T) {
+		other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{"version": "9.9.9"})
+		}))
+		defer other.Close()
+		otherURL := strings.Replace(other.URL, "127.0.0.1", "localhost", 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, otherURL+"/latest", http.StatusFound)
+		}))
+		defer srv.Close()
+		withFakeNPM(t, srv)
+		if _, err := newCLIClient().RunIdentityStaticCalib(); err == nil || !strings.Contains(err.Error(), "源不合法") {
+			t.Fatalf("元数据重定向到异源必须拒绝, err=%v", err)
+		}
+	})
+
+	// 三审 P2：预算耗尽必须显式报错，不能被 tar 当成正常结束（io.LimitReader 的 EOF 陷阱）。
+	t.Run("解压预算耗尽-拒绝", func(t *testing.T) {
+		old := calibMaxDecompressedBytes
+		calibMaxDecompressedBytes = 32
+		t.Cleanup(func() { calibMaxDecompressedBytes = old })
+		srv := startFakeNPM(t, "9.9.9", tarball)
+		defer srv.Close()
+		withFakeNPM(t, srv)
+		if _, err := newCLIClient().RunIdentityStaticCalib(); err == nil || !strings.Contains(err.Error(), "解压流") {
+			t.Fatalf("解压预算耗尽必须拒绝, err=%v", err)
+		}
+	})
+
+	// 三审 P2：integrity 可含多个摘要，任一 sha512 匹配即通过（不能只看首个）。
+	t.Run("多摘要 integrity-任一 sha512 匹配即通过", func(t *testing.T) {
+		correct := tarballIntegrity(tarball)
+		cases := []string{
+			"sha1-AAAAAAAA " + correct,                          // sha1 在前
+			"sha512-" + base64.StdEncoding.EncodeToString(make([]byte, sha512.Size)) + " " + correct, // 错误 sha512 在前
+		}
+		for _, integrity := range cases {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/latest":
+					json.NewEncoder(w).Encode(map[string]any{
+						"version": "9.9.9",
+						"dist": map[string]string{
+							"tarball":   srvBase(r) + "/pkg.tgz",
+							"integrity": integrity,
+						},
+					})
+				case "/pkg.tgz":
+					w.Write(tarball)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			withFakeNPM(t, srv)
+			res, err := newCLIClient().RunIdentityStaticCalib()
+			srv.Close()
+			if err != nil || res.Status != "adapted" {
+				t.Fatalf("integrity=%q 应通过, status=%v err=%v", integrity, res, err)
+			}
+		}
+	})
+
+	// 三审 P2：调用方已有的 CheckRedirect 必须被保留（组合而不是覆盖）。
+	t.Run("保留调用方 CheckRedirect", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/latest":
+				json.NewEncoder(w).Encode(map[string]any{
+					"version": "9.9.9",
+					"dist": map[string]string{
+						"tarball":   srvBase(r) + "/pkg.tgz",
+						"integrity": tarballIntegrity(tarball),
+					},
+				})
+			case "/pkg.tgz":
+				http.Redirect(w, r, srvBase(r)+"/pkg-real.tgz", http.StatusFound)
+			default:
+				w.Write(tarball)
+			}
+		}))
+		defer srv.Close()
+		withFakeNPM(t, srv)
+		c := newCLIClient()
+		c.HTTP = &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return errors.New("blocked by caller policy")
+		}}
+		if _, err := c.RunIdentityStaticCalib(); err == nil || !strings.Contains(err.Error(), "blocked by caller policy") {
+			t.Fatalf("调用方 CheckRedirect 必须生效, err=%v", err)
 		}
 	})
 }

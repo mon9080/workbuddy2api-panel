@@ -15,6 +15,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -38,8 +39,9 @@ var (
 	calibMaxDecompressedBytes int64 = 512 << 20 // 解压流总量上限（防 gzip 炸弹空耗 CPU）
 )
 
-// calibTarballHosts 官方 registry 域白名单（tarball 与元数据同源，且必须 https）。
-// 自定义镜像（含测试 httptest）按「与 npm 元数据端点同源」放行，见 validateTarballURL。
+// calibTarballHosts 官方 registry 域白名单（tarball 与元数据同 hostname，且必须 https）。
+// 自定义镜像（含测试 httptest）按「与 npm 元数据端点同 hostname」放行，
+// 见 validateCalibSourceURL（端口不参与比较）。
 var calibTarballHosts = map[string]bool{
 	"registry.npmjs.org": true,
 	"registry.npmjs.com": true,
@@ -61,61 +63,87 @@ type IdentityCalibResult struct {
 	PersistError string `json:"persist_error,omitempty"`
 }
 
-// validateTarballURL tarball 源校验（codex 二轮 #9）：仅允许官方 registry 域
-// （必须 https），或与 npm 元数据端点**同源**的 host（自定义镜像 / 测试 httptest）。
-// 校验发生在下载前与每次重定向处——元数据把 tarball 指向任意内网/外部地址时
-// 直接拒绝，不发请求。
-func validateTarballURL(raw string) error {
+// validateCalibSourceURL 校准下载链路的源校验（codex 二轮 #9 + 三审 P2）：
+// 元数据与 tarball **两条**请求都走这里。仅允许官方 registry 域（必须 https），
+// 或与 npm 元数据端点**同 hostname**（自定义镜像 / 测试 httptest；端口不参与
+// 比较）。校验发生在请求前与每次重定向处——元数据把 tarball 指向任意内网/
+// 外部地址、或元数据自身被重定向到非可信地址时直接拒绝，不发请求。
+func validateCalibSourceURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("tarball URL 非法: %w", err)
+		return fmt.Errorf("源 URL 非法: %w", err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("tarball URL scheme 不合法: %q", u.Scheme)
+		return fmt.Errorf("源 URL scheme 不合法: %q", u.Scheme)
 	}
 	host := strings.ToLower(u.Hostname())
 	if host == "" {
-		return fmt.Errorf("tarball URL 缺少 host: %q", raw)
+		return fmt.Errorf("源 URL 缺少 host: %q", raw)
 	}
 	if calibTarballHosts[host] {
 		if u.Scheme != "https" {
-			return fmt.Errorf("官方 registry tarball 必须 https: %q", raw)
+			return fmt.Errorf("官方 registry 源必须 https: %q", raw)
 		}
 		return nil
 	}
 	meta, err := url.Parse(npmLatestEndpoint)
 	if err == nil && strings.EqualFold(meta.Hostname(), host) {
-		return nil // 与元数据同源：元数据源可信则 tarball 源可信（含测试与自定义镜像）
+		return nil // 与元数据同 hostname：元数据源可信则下载源可信（含测试与自定义镜像）
 	}
-	return fmt.Errorf("tarball 源不合法（host=%s）：仅允许官方 registry 或与 npm 元数据同源", host)
+	return fmt.Errorf("源不合法（host=%s）：仅允许官方 registry 或与 npm 元数据同 hostname", host)
+}
+
+// calibHTTPClient 返回带源/重定向校验的 client，元数据与 tarball 请求共用。
+//
+//   - 每一跳重定向都先过 validateCalibSourceURL（codex 三审 P2：此前只校验了
+//     tarball 的 dist URL，元数据请求的重定向完全不受约束）；
+//   - 保留调用方已有的 CheckRedirect（三审 P2：直接赋值会丢弃其策略）；
+//   - 最多 5 跳。
+func calibHTTPClient(hc *http.Client) *http.Client {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	client := *hc
+	prev := hc.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := validateCalibSourceURL(req.URL.String()); err != nil {
+			return err
+		}
+		if len(via) >= 5 {
+			return fmt.Errorf("重定向超过 5 次")
+		}
+		if prev != nil {
+			return prev(req, via)
+		}
+		return nil
+	}
+	return &client
 }
 
 // verifyIntegrity 校验 tarball 与 npm 元数据 dist.integrity（sha512-<base64>）。
-// 元数据提供 integrity 时强制校验，不匹配即拒绝（fail-closed）。
+// 元数据提供 integrity 时强制校验：任一 sha512 摘要匹配即通过（npm 可能给空格
+// 分隔的多个摘要）；不含 sha512 或全部不匹配即拒绝（fail-closed）。
 func verifyIntegrity(sum []byte, integrity string) error {
 	const prefix = "sha512-"
 	integrity = strings.TrimSpace(integrity)
 	if integrity == "" {
-		return nil // 元数据未提供 integrity：源校验仍生效（见 validateTarballURL）
+		return nil // 元数据未提供 integrity：源校验仍生效（见 validateCalibSourceURL）
 	}
-	// npm 可能给空格分隔的多个摘要（如 "sha512-… sha1-…"）：取首个 sha512 条目；
-	// 没有 sha512 时拒绝（不支持其它算法，不做静默跳过）。
-	digest := ""
+	got := base64.StdEncoding.EncodeToString(sum)
+	hasSHA512 := false
 	for _, f := range strings.Fields(integrity) {
-		if strings.HasPrefix(f, prefix) {
-			digest = f
-			break
+		if !strings.HasPrefix(f, prefix) {
+			continue
+		}
+		hasSHA512 = true
+		if strings.TrimPrefix(f, prefix) == got {
+			return nil
 		}
 	}
-	if digest == "" {
+	if !hasSHA512 {
 		return fmt.Errorf("integrity 不含 sha512 摘要: %q", integrity)
 	}
-	want := strings.TrimPrefix(digest, prefix)
-	got := base64.StdEncoding.EncodeToString(sum)
-	if got != want {
-		return fmt.Errorf("tarball integrity 校验失败（期望 %s…，实际 %s…）", want[:min(12, len(want))], got[:12])
-	}
-	return nil
+	return fmt.Errorf("tarball integrity 校验失败（实际 %s…）", got[:min(12, len(got))])
 }
 
 // readLimited 读取解包条目并强制大小上限（tar 头里的 Size 不可信，按实际读取量判）。
@@ -130,17 +158,38 @@ func readLimited(r io.Reader, max int64) ([]byte, error) {
 	return b, nil
 }
 
-// fetchNPMDist URL 与版本一起取（/latest 端点带 dist.tarball 与 dist.integrity）。
-func fetchNPMDist(ctx context.Context, hc *http.Client) (version, tarball, integrity string, err error) {
-	if hc == nil {
-		hc = http.DefaultClient
+// errDecompressedBudget 解压流超出预算的哨兵错误：tar.Reader 会把它当作读错误
+// 向上传播，不会被误判为归档正常结束（io.LimitReader 的 EOF 会被误判）。
+var errDecompressedBudget = errors.New("解压流超过大小上限")
+
+// budgetReader 带预算的 reader：预算耗尽返回哨兵错误而非 EOF；remaining 同时
+// 供循环结束后兜底检查（恰好用满也按超限处理，fail-closed）。
+type budgetReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (b *budgetReader) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		return 0, errDecompressedBudget
 	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.r.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+// fetchNPMDist URL 与版本一起取（/latest 端点带 dist.tarball 与 dist.integrity）。
+// 元数据请求走 calibHTTPClient：重定向同样受源策略约束（codex 三审 P2）。
+func fetchNPMDist(ctx context.Context, hc *http.Client) (version, tarball, integrity string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, npmLatestEndpoint, nil)
 	if err != nil {
 		return "", "", "", err
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := hc.Do(req)
+	resp, err := calibHTTPClient(hc).Do(req)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -162,7 +211,7 @@ func fetchNPMDist(ctx context.Context, hc *http.Client) (version, tarball, integ
 	if !plainVersionRe.MatchString(v) || payload.Dist.Tarball == "" {
 		return "", "", "", fmt.Errorf("npm latest 元数据非法: version=%q", payload.Version)
 	}
-	if err := validateTarballURL(payload.Dist.Tarball); err != nil {
+	if err := validateCalibSourceURL(payload.Dist.Tarball); err != nil {
 		return "", "", "", err
 	}
 	return v, payload.Dist.Tarball, strings.TrimSpace(payload.Dist.Integrity), nil
@@ -217,7 +266,7 @@ func (c *Client) RunIdentityStaticCalib() (*IdentityCalibResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("下载/解包官方包失败: %w", err)
 	}
-	res.Checks = append(res.Checks, fmt.Sprintf("tarball 源校验通过（官方 registry/同源）+ 大小上限 %d MiB", calibMaxTarballBytes>>20))
+	res.Checks = append(res.Checks, fmt.Sprintf("下载源校验通过（官方 registry/同 hostname）+ 大小上限 %d MiB", calibMaxTarballBytes>>20))
 	if integrity != "" {
 		res.Checks = append(res.Checks, "tarball sha512 与 npm 元数据一致")
 	} else {
@@ -275,17 +324,8 @@ func (c *Client) RunIdentityStaticCalib() (*IdentityCalibResult, error) {
 
 // downloadAndExtract 下载 tarball 并只解出两个目标文件（流式跳过其余条目）。
 func downloadAndExtract(ctx context.Context, hc *http.Client, url, integrity, destDir string) (distJS, productJSON []byte, err error) {
-	if hc == nil {
-		hc = http.DefaultClient
-	}
-	// 重定向逐跳校验（#9）：每一跳都必须通过源校验，防止元数据借 302 指向内网/外部。
-	client := *hc
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return fmt.Errorf("tarball 重定向超过 5 次")
-		}
-		return validateTarballURL(req.URL.String())
-	}
+	// 重定向逐跳校验（#9 + 三审 P2）：每一跳都必须通过源校验，且保留调用方已有策略。
+	client := calibHTTPClient(hc)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, nil, err
@@ -330,10 +370,16 @@ func downloadAndExtract(ctx context.Context, hc *http.Client, url, integrity, de
 		return nil, nil, err
 	}
 	defer zr.Close()
-	// 解压总量上限：tar 对非目标条目会整段读掉（不落盘但耗 CPU），gzip 炸弹可借
-	// 高分压缩比空耗解压；超限截断后 tar 必然报错 → 校准 fail-closed 失败。
-	tr := tar.NewReader(io.LimitReader(zr, calibMaxDecompressedBytes))
+	// 解压总量上限（codex 三审 P2）：io.LimitReader 在预算耗尽时返回普通 EOF，
+	// tar 会把它当成「正常结束」——必须用自有 reader 返回哨兵错误区分预算耗尽
+	// 与真实 EOF，并在循环后兜底检查剩余额度（恰好用满同样视为超限，fail-closed）。
+	br := &budgetReader{r: zr, remaining: calibMaxDecompressedBytes}
+	tr := tar.NewReader(br)
 	for {
+		// 解压发生在 HTTP 请求之后，不受请求 context 约束：显式检查总超时。
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -352,6 +398,9 @@ func downloadAndExtract(ctx context.Context, hc *http.Client, url, integrity, de
 		if err != nil {
 			return nil, nil, err
 		}
+	}
+	if br.remaining <= 0 {
+		return nil, nil, fmt.Errorf("解压流超过大小上限 %d MiB", calibMaxDecompressedBytes>>20)
 	}
 	if distJS == nil || productJSON == nil {
 		return nil, nil, fmt.Errorf("tarball 缺少 dist/codebuddy.js 或 product.json")
