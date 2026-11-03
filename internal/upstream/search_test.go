@@ -250,3 +250,39 @@ func TestSearchHTTPErrorClassified(t *testing.T) {
 		}
 	}
 }
+
+// TestSearchIdentityGateBlocksOutbound 搜索路径与 chat 同受版本适配门禁约束
+// （2026-11-03 审查发现 #8：SearchHeaders 复用 ChatHeaders，切 CLI 身份后搜索
+// 会绕过 ChatStreamContext 的门禁，把被封的 CLI 指纹发出去）。
+func TestSearchIdentityGateBlocksOutbound(t *testing.T) {
+	hits := 0
+	c := searchTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"results":[],"total_results":0}`))
+	})
+	c.ChatIdentity = identityCLI
+	c.IdentityStrictGate.Store(true)
+	setLatestForTest(c, "99.0.1") // 比当前适配版本新 → 门禁拦截
+
+	_, err := c.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 3, ChatMeta{})
+	if !errors.Is(err, ErrIdentityGateBlocked) {
+		t.Fatalf("Search err = %v, want ErrIdentityGateBlocked（哨兵，供 handler 判请求级拒绝）", err)
+	}
+	if hits != 0 {
+		t.Fatalf("门禁拦截后仍出站 %d 次（mock 上游计数应为 0）", hits)
+	}
+
+	// 桌面端身份不适用门禁（无公开版本源）：同样最新版本快照下照常出站。
+	dc := searchTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"results":[],"total_results":0}`))
+	})
+	dc.IdentityStrictGate.Store(true)
+	setLatestForTest(dc, "99.0.1")
+	if _, err := dc.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 3, ChatMeta{}); err != nil {
+		t.Fatalf("desktop 身份搜索误被门禁拦截: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("desktop 身份搜索出站次数 = %d, want 1", hits)
+	}
+}

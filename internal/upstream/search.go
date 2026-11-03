@@ -20,11 +20,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 const (
@@ -132,6 +134,15 @@ func (c *Client) Search(ctx context.Context, a *auth.Auth, query string, maxResu
 	query = strings.TrimSpace(query)
 	if len(query) < SearchMinQueryLen {
 		return nil, &Error{Kind: ErrClient, Msg: fmt.Sprintf("search query must be at least %d characters", SearchMinQueryLen)}
+	}
+	// 版本适配门禁与 chat 同口径：CLI 身份下搜索同样出站 CLI 头族，未适配新版时
+	// 必须一并拒绝，否则 chat 503 而搜索照发，门禁形同虚设（审查发现 #8）。
+	// 哨兵错误上游由 handler 按「请求级」处理：不罚号、不轮转。
+	if c.cliIdentity() {
+		if blocked, detail := c.IdentityGateBlocked(); blocked {
+			log.Printf("WARN: [upstream] search acct=%s: %s", logfmt.Label(a.UID, a.Nickname), detail)
+			return nil, fmt.Errorf("%w: %s", ErrIdentityGateBlocked, detail)
+		}
 	}
 	body, err := json.Marshal(searchRequestBody{
 		Query:      query,

@@ -36,8 +36,12 @@ fi
 CURRENT=$(grep -oP 'VerifiedCLIVersion = "\K[^"]+' "$REPO_DIR/internal/upstream/cliversion.go")
 log "npm latest=$LATEST 已适配=$CURRENT"
 if [ "$LATEST" = "$CURRENT" ]; then
-  log "已是最新适配版本，无需校准"
-  exit 0
+  if [ "${ORACLE_FORCE:-}" = "1" ]; then
+    log "已是最新适配版本；ORACLE_FORCE=1 → 仍重捕官方出站并跑完整比对"
+  else
+    log "已是最新适配版本，无需校准"
+    exit 0
+  fi
 fi
 
 # ---------- 2. 下载解包 ----------

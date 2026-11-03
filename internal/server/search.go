@@ -55,6 +55,16 @@ func searchMetaFromRequest(r *http.Request) upstream.ChatMeta {
 // 轮转语义与 chat 完全一致：PickExcluding → 在途租约 → token 预刷新 →
 // 上游调用 → 按 ErrKind 走 applyErrorPolicy → 抖动退避换号。
 func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, meta upstream.ChatMeta) (*upstream.SearchOutcome, *searchFailure) {
+	// 版本适配门禁前置：与 chat 同口径，选号前就拒绝——不选号、不罚号、不轮转，
+	// 也不进轮转循环（否则会被当成「选不到号」报成 no_healthy_account，误导运维）。
+	if blocked, detail := h.cfg.Upstream.IdentityGateBlocked(); blocked {
+		log.Printf("WARN: [server] search rejected by identity version gate: %s", detail)
+		return nil, &searchFailure{
+			status: http.StatusServiceUnavailable,
+			msg:    "gateway CLI identity is not adapted to the latest official CodeBuddy CLI release; outbound is disabled until re-calibration.",
+			hint:   detail,
+		}
+	}
 	tried := map[string]bool{}
 	var lastErr error
 	var lastStatus int

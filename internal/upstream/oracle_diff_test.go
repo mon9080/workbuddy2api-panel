@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -63,16 +64,19 @@ func TestOracleGoldenDiff(t *testing.T) {
 		t.Fatalf("读 golden 失败: %v", err)
 	}
 	var official map[string]string
+	var officialBody map[string]any
 	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
 		var entry struct {
 			URL     string            `json:"url"`
 			Headers map[string]string `json:"headers"`
+			Body    map[string]any    `json:"body"`
 		}
 		if json.Unmarshal([]byte(line), &entry) != nil {
 			continue
 		}
 		if strings.Contains(entry.URL, "chat/completions") {
 			official = entry.Headers
+			officialBody = entry.Body
 			break
 		}
 	}
@@ -153,13 +157,36 @@ func TestOracleGoldenDiff(t *testing.T) {
 		"reasoning_summary": "auto",
 		"stream":            true,
 	}
-	for k, want := range wantFields {
+	// 第 4 层（2026-11-03 审查发现 #9）：body 确定性字段与**官方捕获**逐字段比对。
+	// 此前只与本地硬编码期望比，官方改了 verbosity/cache_retention 等值而头不变时
+	// 每日回归照样通过——回归对 body 漂移是盲的。字段集仍由本测试守护（下面是
+	// 硬编码期望：官方删/改键名也要报），值则取官方 golden。
+	if officialBody == nil {
+		t.Fatalf("官方 golden 未记录 chat 请求体——无法校验 body 漂移（需重新捕获）")
+	}
+	var officialPayload map[string]any
+	if o, ok := officialBody["options"].(map[string]any); ok {
+		// 捕获器把 gzip body 解析 JSON 后原样存 body；兼容 body 嵌在 options 的旧形态。
+		officialPayload = o
+	} else {
+		officialPayload = officialBody
+	}
+	officialFields := make([]string, 0, len(wantFields))
+	for k := range wantFields {
+		officialFields = append(officialFields, k)
+	}
+	sort.Strings(officialFields)
+	for _, k := range officialFields {
+		want := officialPayload[k]
 		if got := payload[k]; !reflect.DeepEqual(got, want) {
-			t.Errorf("body 字段 %s = %v, want %v", k, got, want)
+			t.Errorf("body 字段 %s 与官方捕获不符:\n  官方: %v\n  本实现: %v", k, want, got)
 		}
 	}
 	if so, ok := payload["stream_options"].(map[string]any); !ok || so["include_usage"] != true {
 		t.Errorf("body stream_options.include_usage 缺失或非 true: %v", payload["stream_options"])
+	}
+	if oso, ok := officialPayload["stream_options"].(map[string]any); !ok || !reflect.DeepEqual(payload["stream_options"], oso) {
+		t.Errorf("body stream_options 与官方捕获不符:\n  官方: %v\n  本实现: %v", officialPayload["stream_options"], payload["stream_options"])
 	}
 	for _, banned := range []string{"metadata", "conversation_id", "previous_response_id"} {
 		if _, has := payload[banned]; has {
