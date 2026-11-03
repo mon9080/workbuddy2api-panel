@@ -51,9 +51,12 @@ tar -xzf "$TGZ" -C "$PKG"
 log "解包完成: $PKG/package"
 
 # ---------- 3. 提取内嵌 SDK 版本 ----------
-SDK=$(node -e "
+# 注：node 内用相对路径（cd 进解包目录）——Git Bash 的 /d/... 风格路径传入
+# node 的 readFileSync 会被解析成 D:\d\...（POSIX 绝对路径在 Windows node 下
+# 按当前盘符根重写），两处文件读取都必须走 cd + 相对路径。
+SDK=$(cd "$PKG/package" && node -e "
 const fs=require('fs');
-const src=fs.readFileSync('$PKG/package/dist/codebuddy.js','utf8');
+const src=fs.readFileSync('dist/codebuddy.js','utf8');
 const m=src.match(/\"X-Stainless-Package-Version\":\"([^\"]+)\"/);
 process.stdout.write(m?m[1]:'');
 ")
@@ -100,9 +103,9 @@ log "golden 捕获完成: $CAPTURES/requests.jsonl"
 # 从 golden 提取官方实际运行的 node 版本（X-Stainless-Runtime-Version）：
 # 钉扎值必须等于校准运行所用 node——CI runner 的 node 小版本与本仓库常量
 # 漂移时，oracle diff 的全等断言会假失败，这里在 bump 时一并对齐。
-NODE_VER=$(node -e "
+NODE_VER=$(cd "$CAPTURES" && node -e "
 const fs=require('fs');
-const lines=fs.readFileSync('$CAPTURES/requests.jsonl','utf8').trim().split('\n');
+const lines=fs.readFileSync('requests.jsonl','utf8').trim().split('\n');
 for (const l of lines) {
   try { const e=JSON.parse(l);
     if (e.url && e.url.includes('chat/completions') && e.headers && e.headers['x-stainless-runtime-version']) {
@@ -124,13 +127,16 @@ restore_constants() {
   git checkout -- internal/upstream/cliversion.go
   log "已回滚版本常量（保持旧适配版本）"
 }
-trap 'restore_constants' EXIT
+# 失败路径统一兜底：回滚常量 + 杀 mock（两个 trap 合一，后设的 trap 会覆盖
+# 先前的 mock-kill）。必须先 cd 回仓库根——此前的 cwd 是 $WORK（npm pack 目录），
+# 相对路径的 sed/checkout 会静默找错文件（2026-11-03 实案：bump 段静默死亡）。
+cd "$REPO_DIR"
+trap 'restore_constants; kill $MOCK_PID 2>/dev/null || true' EXIT
 sed -i "s/VerifiedCLIVersion = \"[^\"]*\"/VerifiedCLIVersion = \"$LATEST\"/" internal/upstream/cliversion.go
 sed -i "s/VerifiedSDKVersion = \"[^\"]*\"/VerifiedSDKVersion = \"$SDK\"/" internal/upstream/cliversion.go
 sed -i "s/VerifiedNodeVersion = \"[^\"]*\"/VerifiedNodeVersion = \"$NODE_VER\"/" internal/upstream/cliversion.go
 log "候选常量已 bump：CLI=$LATEST SDK=$SDK Node=$NODE_VER，开始 oracle 比对"
 
-cd "$REPO_DIR"
 if ! WB2A_ORACLE_GOLDEN="$CAPTURES/requests.jsonl" go test ./internal/upstream/ -run TestOracleGoldenDiff -v; then
   restore_constants
   trap - EXIT
