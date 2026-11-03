@@ -164,12 +164,20 @@ var errDecompressedBudget = errors.New("解压流超过大小上限")
 
 // budgetReader 带预算的 reader：预算耗尽返回哨兵错误而非 EOF；remaining 同时
 // 供循环结束后兜底检查（恰好用满也按超限处理，fail-closed）。
+// 每次读前检查 context：tar 对非目标条目的跳过、对目标条目的读取都经由这里，
+// 大条目场景下取消/超时才能及时中断（codex 四审 P2：仅在 Next() 之间检查不够）。
 type budgetReader struct {
 	r         io.Reader
 	remaining int64
+	ctx       context.Context
 }
 
 func (b *budgetReader) Read(p []byte) (int, error) {
+	if b.ctx != nil {
+		if err := b.ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
 	if b.remaining <= 0 {
 		return 0, errDecompressedBudget
 	}
@@ -373,13 +381,9 @@ func downloadAndExtract(ctx context.Context, hc *http.Client, url, integrity, de
 	// 解压总量上限（codex 三审 P2）：io.LimitReader 在预算耗尽时返回普通 EOF，
 	// tar 会把它当成「正常结束」——必须用自有 reader 返回哨兵错误区分预算耗尽
 	// 与真实 EOF，并在循环后兜底检查剩余额度（恰好用满同样视为超限，fail-closed）。
-	br := &budgetReader{r: zr, remaining: calibMaxDecompressedBytes}
+	br := &budgetReader{r: zr, remaining: calibMaxDecompressedBytes, ctx: ctx}
 	tr := tar.NewReader(br)
 	for {
-		// 解压发生在 HTTP 请求之后，不受请求 context 约束：显式检查总超时。
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break

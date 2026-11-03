@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // buildFakeTarball 构造只含 dist/codebuddy.js 与 product.json 的官方形态 tarball。
@@ -245,6 +247,60 @@ func TestDownloadAndExtractMissingEntries(t *testing.T) {
 	defer srv.Close()
 	if _, _, err := downloadAndExtract(nil, srv.Client(), srv.URL, "", dir); err == nil {
 		t.Fatal("缺少目标文件应报错")
+	}
+}
+
+// extractCtx 模拟「HTTP 请求已完成、解包阶段才被取消」的场景：Done() 永不
+// 触发（transport 不受影响），但 Err() 恒返回 Canceled——只有解包期间的读取
+// 路径（budgetReader.Read）会看到取消，从而钉死「大条目跳过期间响应取消」。
+type extractCtx struct{ context.Context }
+
+func (extractCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (extractCtx) Done() <-chan struct{}       { c := make(chan struct{}); return c }
+func (extractCtx) Err() error                  { return context.Canceled }
+func (extractCtx) Value(any) any               { return nil }
+
+// TestDownloadAndExtractRespectsContextCancel 解包期间必须响应 context 取消
+// （codex 四审 P2）：大条目的跳过/读取都经由 budgetReader，取消后不得继续把
+// 归档读到底——否则恶意/异常 tarball 可让校准长时间占用容器 CPU。
+func TestDownloadAndExtractRespectsContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
+	// 大型非目标条目：只有读穿它才会轮到目标文件
+	big := strings.Repeat("0123456789", 200000) // ~2MB
+	if err := tw.WriteHeader(&tar.Header{Name: "package/other.bin", Size: int64(len(big)), Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(big)); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"package/dist/codebuddy.js": calibDistOK,
+		"package/product.json":      calibProductOK,
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Size: int64(len(content)), Mode: 0o644}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+
+	if _, _, err := downloadAndExtract(extractCtx{context.Background()}, srv.Client(), srv.URL, "", dir); err == nil {
+		t.Fatal("解包期间 context 已取消必须报错，而不是把大条目读到底")
 	}
 }
 
