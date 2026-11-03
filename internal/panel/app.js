@@ -388,6 +388,30 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+// checkinCell 签到操作单元。企业版无个人成长体系（签到 400「企业账号不支持该
+// 操作」/ 成长任务 403）→ 不渲染；国际版同无语义——上游对 global 恒 400
+// code=10001「签到活动未开启或已过期」，排程也显式跳过（D4），渲染可点按钮
+// 只会误导（提示失败却永不变「已签」）。两者都显示中性标记，不再给死入口。
+function checkinCell(s) {
+  if (s.enterprise) return '';
+  if (s.realm === 'global') {
+    return '<span class="xs" style="opacity:.55;cursor:default" title="国际版账号无签到活动（上游 code=10001）；排程亦跳过签到">无签到</span>';
+  }
+  return '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>';
+}
+
+// checkinToastResult 手动签到的提示文案与级别。只有 checkin_done=true 才宣称
+// 完成——上游业务错误（如国际版「签到活动未开启」）时后端返回 ok:true 但
+// checkin_done=false，此前一律按成功 toast，造成「提示签到完成、按钮却永不
+// 翻转为已签」的自相矛盾。失败时必须如实报原因。
+function checkinToastResult(r) {
+  const credTxt = r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '';
+  if (r.checkin_done) {
+    return { text: '签到完成' + credTxt + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), kind: 'ok' };
+  }
+  return { text: '签到未完成' + credTxt + (r.checkin_message ? '：' + r.checkin_message : ''), kind: 'err' };
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
@@ -457,11 +481,7 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
-        // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
-        // upstream 的 get-enterprise-user-usage 口径填充。
-        (s.enterprise ? '' :
-          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+        checkinCell(s) +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
         (s.enterprise ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
@@ -563,7 +583,8 @@ $('accBody').addEventListener('click', async ev => {
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
-      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      const t = checkinToastResult(r);
+      toast(t.text, t.kind);
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
