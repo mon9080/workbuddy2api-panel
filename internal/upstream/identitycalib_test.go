@@ -14,9 +14,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // buildFakeTarball 构造只含 dist/codebuddy.js 与 product.json 的官方形态 tarball。
@@ -250,57 +250,31 @@ func TestDownloadAndExtractMissingEntries(t *testing.T) {
 	}
 }
 
-// extractCtx 模拟「HTTP 请求已完成、解包阶段才被取消」的场景：Done() 永不
-// 触发（transport 不受影响），但 Err() 恒返回 Canceled——只有解包期间的读取
-// 路径（budgetReader.Read）会看到取消，从而钉死「大条目跳过期间响应取消」。
-type extractCtx struct{ context.Context }
-
-func (extractCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
-func (extractCtx) Done() <-chan struct{}       { c := make(chan struct{}); return c }
-func (extractCtx) Err() error                  { return context.Canceled }
-func (extractCtx) Value(any) any               { return nil }
-
-// TestDownloadAndExtractRespectsContextCancel 解包期间必须响应 context 取消
-// （codex 四审 P2）：大条目的跳过/读取都经由 budgetReader，取消后不得继续把
-// 归档读到底——否则恶意/异常 tarball 可让校准长时间占用容器 CPU。
-func TestDownloadAndExtractRespectsContextCancel(t *testing.T) {
+// TestExtractTarballRespectsContextCancel 解包阶段必须响应 context 取消
+// （codex 四审 P2）。窗口定位：下载期的取消由 net/http 传播；解包读的是本地
+// 文件、与 ctx 无耦合。构造含大型非目标条目的 tarball 落盘，用已取消的 ctx
+// 解包，必须报 context.Canceled；读取路径不检查 ctx 的旧实现会成功返回，
+// 因此本测试对旧实现必然失败。
+func TestExtractTarballRespectsContextCancel(t *testing.T) {
 	dir := t.TempDir()
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(zw)
-	// 大型非目标条目：只有读穿它才会轮到目标文件
-	big := strings.Repeat("0123456789", 200000) // ~2MB
-	if err := tw.WriteHeader(&tar.Header{Name: "package/other.bin", Size: int64(len(big)), Mode: 0o644}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tw.Write([]byte(big)); err != nil {
-		t.Fatal(err)
-	}
-	for name, content := range map[string]string{
+	path := filepath.Join(dir, "pkg.tgz")
+	if err := writeTarballFile(path, map[string]string{
+		"package/other.bin":         strings.Repeat("0123456789", 200000), // ~2MB 非目标条目
 		"package/dist/codebuddy.js": calibDistOK,
 		"package/product.json":      calibProductOK,
-	} {
-		if err := tw.WriteHeader(&tar.Header{Name: name, Size: int64(len(content)), Mode: 0o644}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := tw.Write([]byte(content)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tw.Close(); err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := zw.Close(); err != nil {
+	f, err := os.Open(path)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(buf.Bytes())
-	}))
-	defer srv.Close()
-
-	if _, _, err := downloadAndExtract(extractCtx{context.Background()}, srv.Client(), srv.URL, "", dir); err == nil {
-		t.Fatal("解包期间 context 已取消必须报错，而不是把大条目读到底")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 解包开始前就已取消
+	if _, _, err := extractTarball(ctx, f, dir); !errors.Is(err, context.Canceled) {
+		t.Fatalf("解包期间 context 已取消必须返回 context.Canceled，实际 err=%v", err)
 	}
 }
 
@@ -484,4 +458,26 @@ func TestIdentityCalibDownloadSecurity(t *testing.T) {
 			t.Fatalf("调用方 CheckRedirect 必须生效, err=%v", err)
 		}
 	})
+}
+
+// writeTarballFile 构造 tarball 落盘（供解包函数直接读本地文件的用例使用）。
+func writeTarballFile(path string, entries map[string]string) error {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
+	for name, content := range entries {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Size: int64(len(content)), Mode: 0o644}); err != nil {
+			return err
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			return err
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o600)
 }

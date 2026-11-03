@@ -373,6 +373,14 @@ func downloadAndExtract(ctx context.Context, hc *http.Client, url, integrity, de
 		return nil, nil, err
 	}
 	defer f.Close()
+	// 解包与下载是两个阶段：下载期的 ctx 取消由 net/http 负责传播；解包期读的是
+	// 本地文件、与 ctx 无耦合，靠 extractTarball 内部的预算/ctx 检查响应取消。
+	return extractTarball(ctx, f, destDir)
+}
+
+// extractTarball 从已下载的 tarball 文件中只解出两个目标文件（流式跳过其余条目）。
+// ctx 在每次读取时被检查——下载完成后的取消/超时仍能及时中止解包。
+func extractTarball(ctx context.Context, f *os.File, destDir string) (distJS, productJSON []byte, err error) {
 	zr, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, nil, err
