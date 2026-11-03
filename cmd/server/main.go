@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -345,7 +346,12 @@ func main() {
 		// 一键适配升级的版本持久化：读盘 → 改两个键 → 复用 SaveConfig 同一链路
 		//（校验 + 落盘 + 热生效）。端点在成功后调用；失败时热覆盖已生效，
 		// 由端点如实转告「重启回退」。
+		//
+		// 整个事务必须与面板保存互斥（codex 二轮 P1-1 完整版）：否则并发保存会
+		// 互相覆盖整档提交。故持 configWriteMu 直至 saveConfigLocked 返回。
 		PersistIdentityVersions: func(cli, sdk string) error {
+			configWriteMu.Lock()
+			defer configWriteMu.Unlock()
 			raw, err := os.ReadFile(*cfgPath)
 			if err != nil {
 				return err
@@ -365,7 +371,7 @@ func main() {
 			if err != nil {
 				return err
 			}
-			_, err = saveConfig(out, *cfgPath, live, p, up, sch)
+			_, err = saveConfigLocked(out, *cfgPath, live, p, up, sch)
 			return err
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
@@ -512,7 +518,24 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
+// configWriteMu 串行化所有 config 写事务（面板保存 + 一键适配持久化）。
+//
+// 写 config 是「读盘 → 合并 → 校验 → 落盘 → 热应用」的多步事务：无锁时两个
+// 并发保存各自读到旧盘、各自整档提交，后写者覆盖前者且携带过期快照；共享
+// path+".tmp" 还可能让一次 rename 搬走另一方的内容（codex 二轮 P1-1 完整版）。
+var configWriteMu sync.Mutex
+
+// saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
+// 持锁入口：与一键适配持久化（PersistIdentityVersions）互斥，见 configWriteMu。
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+	return saveConfigLocked(raw, path, live, p, up, sch)
+}
+
+// saveConfigLocked 与 saveConfig 相同，但要求调用方已持有 configWriteMu——
+// 一键适配持久化需要把「读盘 → 改键 → 提交」整体放进同一写事务。
+func saveConfigLocked(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -538,8 +561,20 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	// 唯一临时名：并发/残留 tmp 互不复用（历史共享 path+".tmp" 时，一次成功的
+	// rename 可能搬走另一并发保存写入的内容）。
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write(out); err != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("write config: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -548,6 +583,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		// atomic path for regular files, but update the mounted file in place
 		// for this specific deployment shape.
 		if !errors.Is(err, syscall.EBUSY) {
+			_ = os.Remove(tmp)
 			return nil, fmt.Errorf("replace config: %w", err)
 		}
 		f, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)

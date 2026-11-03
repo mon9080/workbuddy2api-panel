@@ -6,6 +6,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -47,7 +49,14 @@ var baggage="codebuddy.session_id=x";var feat="RequestBodyGzip";`
 
 const calibProductOK = `{"productName":"CodeBuddy","platform":"CLI","productFeatures":{"RequestBodyGzip":true}}`
 
-// startFakeNPM 启动伪 npm：/latest 返回元数据（含 dist.tarball），/pkg.tgz 返回构造包。
+// tarballIntegrity 计算 npm 形态的 dist.integrity（sha512-<base64>）。
+func tarballIntegrity(b []byte) string {
+	sum := sha512.Sum512(b)
+	return "sha512-" + base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// startFakeNPM 启动伪 npm：/latest 返回元数据（含 dist.tarball 与 dist.integrity），
+// /pkg.tgz 返回构造包。
 func startFakeNPM(t *testing.T, version string, tarball []byte) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +64,10 @@ func startFakeNPM(t *testing.T, version string, tarball []byte) *httptest.Server
 		case "/latest":
 			json.NewEncoder(w).Encode(map[string]any{
 				"version": version,
-				"dist":    map[string]string{"tarball": srvBase(r) + "/pkg.tgz"},
+				"dist": map[string]string{
+					"tarball":   srvBase(r) + "/pkg.tgz",
+					"integrity": tarballIntegrity(tarball),
+				},
 			})
 		case "/pkg.tgz":
 			w.Write(tarball)
@@ -230,7 +242,97 @@ func TestDownloadAndExtractMissingEntries(t *testing.T) {
 		w.Write(buf.Bytes())
 	}))
 	defer srv.Close()
-	if _, _, err := downloadAndExtract(nil, srv.Client(), srv.URL, dir); err == nil {
+	if _, _, err := downloadAndExtract(nil, srv.Client(), srv.URL, "", dir); err == nil {
 		t.Fatal("缺少目标文件应报错")
 	}
+}
+
+// TestIdentityCalibDownloadSecurity 下载安全（codex 二轮 #5/#9）：
+// 源/重定向校验、大小上限、integrity 强制。任一失效都可能被异常或恶意
+// npm 元数据利用（写满磁盘 / 指向内网 / 替换包内容）。
+func TestIdentityCalibDownloadSecurity(t *testing.T) {
+	tarball := buildFakeTarball(t, calibDistOK, calibProductOK)
+
+	t.Run("integrity 不匹配-拒绝", func(t *testing.T) {
+		wrong := "sha512-" + base64.StdEncoding.EncodeToString(make([]byte, sha512.Size))
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/latest":
+				json.NewEncoder(w).Encode(map[string]any{
+					"version": "9.9.9",
+					"dist": map[string]string{
+						"tarball":   srvBase(r) + "/pkg.tgz",
+						"integrity": wrong,
+					},
+				})
+			case "/pkg.tgz":
+				w.Write(tarball)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+		withFakeNPM(t, srv)
+		if _, err := newCLIClient().RunIdentityStaticCalib(); err == nil || !strings.Contains(err.Error(), "integrity") {
+			t.Fatalf("integrity 不匹配必须拒绝, err=%v", err)
+		}
+	})
+
+	t.Run("tarball 源不合法-不发下载请求", func(t *testing.T) {
+		hits := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			json.NewEncoder(w).Encode(map[string]any{
+				"version": "9.9.9",
+				"dist":    map[string]string{"tarball": "https://evil.example/pkg.tgz"},
+			})
+		}))
+		defer srv.Close()
+		withFakeNPM(t, srv)
+		if _, err := newCLIClient().RunIdentityStaticCalib(); err == nil || !strings.Contains(err.Error(), "源不合法") {
+			t.Fatalf("非白名单源必须拒绝, err=%v", err)
+		}
+		if hits != 1 {
+			t.Fatalf("只应请求元数据一次（不下载），实际 %d 次", hits)
+		}
+	})
+
+	t.Run("重定向到异源-拒绝", func(t *testing.T) {
+		other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write(tarball)
+		}))
+		defer other.Close()
+		// 元数据 host=127.0.0.1；重定向目标改成 localhost（host 名不同）→ 逐跳校验拒绝。
+		otherURL := strings.Replace(other.URL, "127.0.0.1", "localhost", 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/latest":
+				json.NewEncoder(w).Encode(map[string]any{
+					"version": "9.9.9",
+					"dist":    map[string]string{"tarball": srvBase(r) + "/pkg.tgz"},
+				})
+			case "/pkg.tgz":
+				http.Redirect(w, r, otherURL+"/pkg.tgz", http.StatusFound)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+		withFakeNPM(t, srv)
+		if _, err := newCLIClient().RunIdentityStaticCalib(); err == nil || !strings.Contains(err.Error(), "源不合法") {
+			t.Fatalf("重定向到异源必须拒绝, err=%v", err)
+		}
+	})
+
+	t.Run("超过大小上限-拒绝", func(t *testing.T) {
+		old := calibMaxTarballBytes
+		calibMaxTarballBytes = 64 // 构造包（gzip 后数百字节）必然超限
+		t.Cleanup(func() { calibMaxTarballBytes = old })
+		srv := startFakeNPM(t, "9.9.9", tarball)
+		defer srv.Close()
+		withFakeNPM(t, srv)
+		if _, err := newCLIClient().RunIdentityStaticCalib(); err == nil || !strings.Contains(err.Error(), "大小上限") {
+			t.Fatalf("超过大小上限必须拒绝, err=%v", err)
+		}
+	})
 }
