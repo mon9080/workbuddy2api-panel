@@ -395,7 +395,9 @@ setTimeout(() => {
 function checkinCell(s) {
   if (s.enterprise) return '';
   if (s.realm === 'global') {
-    return '<span class="xs" style="opacity:.55;cursor:default" title="国际版账号无签到活动（上游 code=10001）；排程亦跳过签到">无签到</span>';
+    // 与其它操作按钮同款（xs ghost + 原生 disabled 态），只是不可点——
+    // 裸文字在操作列里视觉突兀，禁用按钮与原「签到」位置/尺寸一致。
+    return '<button class="xs ghost" type="button" disabled title="国际版账号无签到活动（上游 code=10001）；排程亦跳过签到">无签到</button>';
   }
   return '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>';
 }

@@ -50,6 +50,8 @@ process.stdout.write(JSON.stringify({
   // 判别力：国际版即使 checkin_done=true（历史脏状态）也不得渲染可点按钮。
   globalHasNoButton: globalCell.indexOf('data-a="checkin"') < 0,
   globalShowsNeutral: globalCell.indexOf('无签到') >= 0,
+  // 视觉一致性：与其它操作按钮同款 xs ghost + 原生 disabled 态（用户反馈裸文字太丑）。
+  globalSameStyle: globalCell.indexOf('class="xs ghost"') >= 0 && globalCell.indexOf('disabled') >= 0,
   entEmpty: entCell === '',
 
   ok: ctx.checkinToastResult({ checkin_done: true, credits: 252, credits_total: 550 }),
@@ -80,6 +82,7 @@ process.stdout.write(JSON.stringify({
 		CNDoneHasTitle    bool `json:"cnDoneHasTitle"`
 		GlobalHasNoButton bool `json:"globalHasNoButton"`
 		GlobalShowsNeutral bool `json:"globalShowsNeutral"`
+		GlobalSameStyle   bool `json:"globalSameStyle"`
 		EntEmpty          bool `json:"entEmpty"`
 		OK                struct {
 			Text string `json:"text"`
@@ -113,6 +116,9 @@ process.stdout.write(JSON.stringify({
 	}
 	if !got.GlobalShowsNeutral {
 		t.Fatal("国际版应显示中性「无签到」标记")
+	}
+	if !got.GlobalSameStyle {
+		t.Fatal("「无签到」必须与其它操作按钮同款（xs ghost + disabled 态）")
 	}
 	if !got.EntEmpty {
 		t.Fatal("企业版不渲染签到单元")
