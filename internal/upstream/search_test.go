@@ -262,6 +262,7 @@ func TestSearchIdentityGateBlocksOutbound(t *testing.T) {
 	})
 	c.ChatIdentity = identityCLI
 	c.IdentityStrictGate.Store(true)
+	c.IdentityVersionCheck.Store(true) // 门禁拦截断言需「检查开」态（P1-3）
 	setLatestForTest(c, "99.0.1") // 比当前适配版本新 → 门禁拦截
 
 	_, err := c.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 3, ChatMeta{})

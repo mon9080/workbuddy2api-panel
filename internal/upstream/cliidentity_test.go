@@ -16,10 +16,13 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// newCLIClient 构造 CLI 身份的 Client（显式 ChatIdentity=cli）。
+// newCLIClient 构造 CLI 身份的 Client（显式 ChatIdentity=cli）。版本检查按
+// 生产默认开启——门禁评估已把「检查关 = 永不拦截」列为不变量（P1-3），门禁
+// 相关测试需在开检查态下断言拦截。
 func newCLIClient() *Client {
 	c := New()
 	c.ChatIdentity = identityCLI
+	c.IdentityVersionCheck.Store(true)
 	return c
 }
 

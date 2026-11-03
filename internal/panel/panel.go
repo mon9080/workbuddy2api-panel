@@ -170,6 +170,7 @@ func (p *Panel) routes() {
 	// 身份版本状态 + 一键适配升级（静态校准，见 upstream/identitycalib.go）。
 	p.mux.HandleFunc("GET /panel/api/identity/status", p.withAuth(p.identityStatus))
 	p.mux.HandleFunc("POST /panel/api/identity/calibrate", p.withAuth(p.identityCalibrate))
+	p.mux.HandleFunc("POST /panel/api/identity/reset-latest", p.withAuth(p.identityResetLatest))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
@@ -598,8 +599,12 @@ func (p *Panel) identityStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // identityCalibrate 一键适配升级：容器内静态校准（下载官方 tarball → 指纹常量
-// 核对 → 全过热覆盖生效版本并持久化；漂移则拒绝并报字段）。耗时约 1-2 分钟
+// 核对 → **先持久化、后热生效**；漂移则拒绝并报字段）。耗时约 1-2 分钟
 // （65MB 下载），前端按钮需带 loading 态。
+//
+// 次序关键（审查发现 #7）：落盘失败时**不**切换运行时版本——门禁继续用旧版本
+// 拦截，运行态与磁盘态始终一致；此前的「先热生效后落盘」会在失败时静默分叉
+// （重启回退），且第二次点击命中 current 后永不再补写。
 func (p *Panel) identityCalibrate(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Upstream == nil {
 		writeErr(w, http.StatusNotImplemented, "upstream client unavailable")
@@ -611,18 +616,48 @@ func (p *Panel) identityCalibrate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if res.Status == "adapted" && p.cfg.PersistIdentityVersions != nil {
-		if err := p.cfg.PersistIdentityVersions(res.NewCLI, res.NewSDK); err != nil {
-			// 热覆盖已生效但落盘失败：可用但重启回退——如实上报，不静默。
-			log.Printf("ERR: panel: persist identity versions failed: %v", err)
-			res.Checks = append(res.Checks, "注意：热生效成功但配置落盘失败（重启后回退），请检查 config 写入")
+	if res.Status == "adapted" {
+		if p.cfg.PersistIdentityVersions == nil {
+			// 未装配持久化：只做进程内热更（重启回退），如实标注。
+			res.Persisted = false
+			res.PersistError = "未装配配置持久化（重启后回退）"
+			p.cfg.Upstream.SetIdentityVerified(res.NewCLI, res.NewSDK)
+			res.Checks = append(res.Checks, "仅热生效，未持久化")
+		} else if err := p.cfg.PersistIdentityVersions(res.NewCLI, res.NewSDK); err != nil {
+			// 落盘失败：切换状态为 persist_failed，运行时**保持旧版**、门禁不放行。
+			log.Printf("ERR: panel: persist identity versions failed (runtime keeps %s): %v", res.OldCLI, err)
+			res.Status = "persist_failed"
+			res.Persisted = false
+			res.PersistError = err.Error()
+			// 报告失败时刻的**真实生效对**（codex 二轮 P2-8）：OldCLI 是下载前
+			// 采样，并发保存下可能已过期；NewSDK 置空则与字段语义不符。
+			res.NewCLI, res.NewSDK = p.cfg.Upstream.EffectiveCLIVersion(), p.cfg.Upstream.EffectiveSDKVersion()
 		} else {
-			res.Checks = append(res.Checks, "已写入配置持久化")
+			// 落盘成功。**此处不得再调 SetIdentityVerified**（codex 二轮 P1-1）：
+			// 生产回调（main.go PersistIdentityVersions → SaveConfig 链路）成功时
+			// 已热应用；面板若二次发布，校准 A 与并发保存 B 交错后会出现
+			// 磁盘 B / 运行时 A 的分叉。回调契约：成功返回前必须完成热应用。
+			res.Persisted = true
+			res.Checks = append(res.Checks, "已写入配置持久化并热生效")
 		}
 	}
-	log.Printf("panel: identity calibrate status=%s latest=%s verified=%s->%s drift=%v",
-		res.Status, res.Latest, res.OldCLI, res.NewCLI, res.Drift)
+	log.Printf("panel: identity calibrate status=%s latest=%s verified=%s->%s persisted=%v drift=%v",
+		res.Status, res.Latest, res.OldCLI, res.NewCLI, res.Persisted, res.Drift)
 	writeJSON(w, http.StatusOK, res)
+}
+
+// identityResetLatest 人工清空 npm latest 快照（codex 二轮 P1-2 的恢复出口）。
+// 快照只进不退（fail-closed），npm yank 新版并回退 dist-tag 后会保留已撤销的
+// 更高版本，门禁永久拦截；此处清空后门禁立即放行（latest 未知），下一小时
+// 巡检重新拉取真实 latest。生产已由「检查关即清空」覆盖常规关闭场景。
+func (p *Panel) identityResetLatest(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Upstream == nil {
+		writeErr(w, http.StatusNotImplemented, "upstream client unavailable")
+		return
+	}
+	p.cfg.Upstream.ClearIdentityLatestSnapshot()
+	log.Printf("panel: identity latest snapshot cleared（人工重置；下一小时巡检重拉 npm latest）")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // accountDisable 人工禁用（不再参与选号，需面板 revive 或重登恢复）。

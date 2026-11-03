@@ -3484,7 +3484,15 @@ async function renderIdentityCard() {
       btn.textContent = '一键适配升级';
       btn.style.cssText = 'padding:6px 14px;border-radius:8px;border:1px solid #b9b9c6;cursor:pointer';
       btn.onclick = identityCalibrate;
-      card.appendChild(h); card.appendChild(info); card.appendChild(btn);
+      // 快照只进不退（fail-closed）：npm yank 新版并回退 dist-tag 后，门禁会
+      // 拿着已撤销的更高版本永久拦截——此按钮清空快照立即放行，巡检自动重拉。
+      const reset = document.createElement('button');
+      reset.id = 'identityResetBtn';
+      reset.type = 'button';
+      reset.textContent = '重置版本快照';
+      reset.style.cssText = 'padding:6px 14px;border-radius:8px;border:1px solid #b9b9c6;cursor:pointer;margin-left:8px';
+      reset.onclick = identityResetLatest;
+      card.appendChild(h); card.appendChild(info); card.appendChild(btn); card.appendChild(reset);
       form.parentNode.insertBefore(card, form);
     }
     const s = await api('identity/status');
@@ -3508,7 +3516,15 @@ async function identityCalibrate() {
     if (r.status === 'current') {
       toast('已是最新适配版本（' + r.latest + '），无需操作', 'ok');
     } else if (r.status === 'adapted') {
-      toast('已适配官方 ' + r.new_cli + '（SDK ' + r.new_sdk + '），版本门禁解除', 'ok');
+      if (r.persisted === false) {
+        // 未装配持久化的备用接线：热已生效但重启回退，不得宣称「已持久化」。
+        toast('已适配官方 ' + r.new_cli + '（仅热生效，未持久化——重启后回退）', 'err');
+      } else {
+        toast('已适配官方 ' + r.new_cli + '（SDK ' + r.new_sdk + '），已持久化并热生效；出站形态待 oracle 深度验证确认', 'ok');
+      }
+    } else if (r.status === 'persist_failed') {
+      // 落盘失败：运行时**未切换**（门禁继续拦截），必须醒目报错而非当成功。
+      toast('适配核对通过，但配置持久化失败：' + (r.persist_error || '未知原因') + '。运行时仍为已适配 ' + r.new_cli + '，门禁未解除，请检查 config 可写性后重试', 'err');
     } else {
       toast('检测到出站形态漂移，未适配：' + (r.drift || []).join('；'), 'err');
     }
@@ -3518,5 +3534,18 @@ async function identityCalibrate() {
   } finally {
     btn.disabled = false;
     btn.textContent = '一键适配升级';
+  }
+}
+async function identityResetLatest() {
+  const btn = $('identityResetBtn');
+  btn.disabled = true;
+  try {
+    await api('identity/reset-latest', { method: 'POST' });
+    toast('版本快照已清空，门禁放行；下一小时巡检自动重拉 npm latest', 'ok');
+    await renderIdentityCard();
+  } catch (e) {
+    toast('重置失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
   }
 }

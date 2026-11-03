@@ -97,7 +97,7 @@ func TestRunIdentityStaticCalib(t *testing.T) {
 		}
 	})
 
-	t.Run("适配成功-热覆盖且门禁解除", func(t *testing.T) {
+	t.Run("适配成功-只返回候选不发布", func(t *testing.T) {
 		srv := startFakeNPM(t, "9.9.9", buildFakeTarball(t, calibDistOK, calibProductOK))
 		defer srv.Close()
 		withFakeNPM(t, srv)
@@ -114,20 +114,68 @@ func TestRunIdentityStaticCalib(t *testing.T) {
 		if res.Status != "adapted" || res.NewCLI != "9.9.9" || res.NewSDK != "7.40.0" {
 			t.Fatalf("status=%s new=%s/%s", res.Status, res.NewCLI, res.NewSDK)
 		}
-		// 出站版本随之切换 + 门禁解除。
+		// 审查发现 #7：校准器**只核对不发布**——落盘前运行态必须保持旧版。
+		if got := c.EffectiveCLIVersion(); got != VerifiedCLIVersion {
+			t.Errorf("校准器不得自行热覆盖：EffectiveCLI=%s want %s", got, VerifiedCLIVersion)
+		}
+		if blocked, _ := c.IdentityGateBlocked(); !blocked {
+			t.Error("落盘前门禁必须保持拦截")
+		}
+		// 调用方（面板层）落盘成功后热生效：UA/SDK 切换、门禁解除。
+		c.SetIdentityVerified(res.NewCLI, res.NewSDK)
 		if got := c.cliUserAgent(); !strings.Contains(got, "CLI/9.9.9 CodeBuddy/9.9.9") {
-			t.Errorf("适配后 UA 未切换: %s", got)
+			t.Errorf("热生效后 UA 未切换: %s", got)
 		}
 		if got := c.EffectiveSDKVersion(); got != "7.40.0" {
-			t.Errorf("适配后 SDK 版本未切换: %s", got)
+			t.Errorf("热生效后 SDK 版本未切换: %s", got)
 		}
 		if blocked, _ := c.IdentityGateBlocked(); blocked {
-			t.Error("适配后门禁应解除")
+			t.Error("热生效后门禁应解除")
 		}
 		// 还原覆盖：回落编译常量。
 		c.SetIdentityVerified("", "")
 		if c.EffectiveCLIVersion() != VerifiedCLIVersion {
 			t.Error("清空覆盖应回落编译常量")
+		}
+	})
+
+	t.Run("校准发现新版即发布快照（漂移也保留）", func(t *testing.T) {
+		// 审查发现 #3：后台轮询尚未看到 9.9.9，校准拿到元数据后即使 drift，
+		// 门禁也必须立刻看到新版，而不是等下一小时巡检。
+		driftDist := strings.Replace(calibDistOK, "codebuddy.session_id", "other.session_key", 1)
+		srv := startFakeNPM(t, "9.9.9", buildFakeTarball(t, driftDist, calibProductOK))
+		defer srv.Close()
+		withFakeNPM(t, srv)
+		c := newCLIClient()
+		c.IdentityStrictGate.Store(true)
+		setLatestForTest(c, "") // 模拟轮询尚未探测到（latest 未知 → 门禁放行）
+		if blocked, _ := c.IdentityGateBlocked(); blocked {
+			t.Fatal("前置失败：latest 未知时不应拦截")
+		}
+		res, err := c.RunIdentityStaticCalib()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Status != "drift" {
+			t.Fatalf("status=%s want drift", res.Status)
+		}
+		if blocked, _ := c.IdentityGateBlocked(); !blocked {
+			t.Error("校准观测到新版后门禁必须立即拦截（无需等轮询）")
+		}
+	})
+
+	t.Run("校准观测到新版后坏包也保留快照", func(t *testing.T) {
+		srv := startFakeNPM(t, "9.9.9", []byte("not a tarball"))
+		defer srv.Close()
+		withFakeNPM(t, srv)
+		c := newCLIClient()
+		c.IdentityStrictGate.Store(true)
+		setLatestForTest(c, "")
+		if _, err := c.RunIdentityStaticCalib(); err == nil {
+			t.Fatal("坏 tarball 应报错")
+		}
+		if blocked, _ := c.IdentityGateBlocked(); !blocked {
+			t.Error("下载失败不得丢失已观测到的新版（否则门禁窗口被打开）")
 		}
 	})
 

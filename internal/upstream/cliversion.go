@@ -50,6 +50,14 @@ const (
 // 生产恒为 npmLatestURL）。
 var npmLatestEndpoint = npmLatestURL
 
+// SetNPMLatestEndpointForTest 替换 npm latest 端点（测试指向 httptest 服务器），
+// 返回原值供 defer 还原。
+func SetNPMLatestEndpointForTest(url string) func() {
+	old := npmLatestEndpoint
+	npmLatestEndpoint = url
+	return func() { npmLatestEndpoint = old }
+}
+
 const (
 	// identityCheckInterval 后台版本检查周期。官方节奏约日更，1 小时粒度足够；
 	// TTL 缓存（3 天）不适用于该端点——元数据本身只有几 KB，直接查。
@@ -76,8 +84,9 @@ type identityVersionState struct {
 	verifiedSDK string
 }
 
-// SetIdentityVerified 热覆盖生效的已适配版本（静态校准通过后调用；空串还原
-// 编译常量）。
+// SetIdentityVerified 热覆盖生效的已适配版本（配置落盘成功后调用；空串还原
+// 编译常量）。一键适配走「先落盘、后热生效」：落盘失败时不调用，运行时保持
+// 旧版本、门禁继续拦截（审查发现 #7）。
 func (c *Client) SetIdentityVerified(cli, sdk string) {
 	c.identityVersion.mu.Lock()
 	c.identityVersion.verifiedCLI = strings.TrimSpace(cli)
@@ -164,8 +173,12 @@ func (c *Client) checkIdentityVersion(ctx context.Context) {
 		return
 	}
 	c.identityVersion.mu.Lock()
-	c.identityVersion.latest = latest
-	c.identityVersion.checkedAt = time.Now()
+	// 只进不退：npm 回退 dist-tag 时不得把已知的更新版抹掉（否则门禁窗口被
+	// 悄悄打开）；同版或更新才覆盖（审查发现 #3）。
+	if c.identityVersion.latest == "" || compareVersion(latest, c.identityVersion.latest) >= 0 {
+		c.identityVersion.latest = latest
+		c.identityVersion.checkedAt = time.Now()
+	}
 	c.identityVersion.mu.Unlock()
 	if latest != VerifiedCLIVersion {
 		log.Printf("WARN: [upstream] 官方 CLI 已发布 %s（已适配 %s）：%s",
@@ -179,10 +192,12 @@ const identityGateHint = "等待每日 oracle 校准 Action 自动 bump verified
 // IdentityGateBlocked 报告 CLI 身份 chat 出站是否应被版本适配门禁拒绝。
 // 返回 (false, "") = 放行；(true, detail) = 拒绝，detail 为中文说明（含两版本号）。
 //
-// 拦截条件（全部满足）：身份为 cli；strict gate 开；latest 已知且比 verified 新。
-// 任一不满足即放行：desktop 身份无公开版本源不适用门禁；strict 关 = 用户显式
-// 选择了「告警放行」；latest 空 = 从未成功检查（不因自身网络故障停服）；
-// latest 旧于等于 verified = 已适配（npm 回退/同版不拦截）。
+// 拦截条件（全部满足）：身份为 cli；strict gate 开；版本检查开；latest 已知
+// 且比 verified 新。任一不满足即放行：desktop 身份无公开版本源不适用门禁；
+// strict 关 = 用户显式选择了「告警放行」；版本检查关 = 版本未知（P1-3，
+// 与关闭即清空快照同一契约）；latest 空 = 从未成功检查（不因自身网络故障
+// 停服）；latest 旧于等于 verified = 已适配（npm 回退/同版不拦截）。
+
 // ClearIdentityLatestSnapshot 清空已快照的 npm latest（热关闭 identity_version_check
 // 时由面板保存路径调用，codex 交叉审查 #2：不等下一小时巡检——否则已触发的门禁
 // 在热关后最长继续拦截约一小时，违背「关闭 = 版本未知、门禁永不触发」的配置承诺）。
@@ -192,11 +207,42 @@ func (c *Client) ClearIdentityLatestSnapshot() {
 	c.identityVersion.mu.Unlock()
 }
 
+// ObserveLatest 把一次**成功获取的** npm latest 发布到门禁共享快照。
+//
+// 校准路径用（审查发现 #3）：一键适配拿到元数据后就立刻发布，之后无论
+// drift、解包失败还是落盘失败都保留该观测——否则「校准明明发现新版却
+// 因失败没更新快照」会让门禁在下一小时巡检前继续放行未适配版本。
+// 同样只进不退（与后台轮询口径一致）。
+//
+// 版本检查关闭时不发布（codex 二轮 P1-3）：关闭 = 版本未知，校准观测不得
+// 把快照重新武装起来；与 checkIdentityVersionSafe 关闭即清空同一口径。
+func (c *Client) ObserveLatest(v string) {
+	if !c.IdentityVersionCheck.Load() {
+		return
+	}
+	v = strings.TrimSpace(v)
+	if !plainVersionRe.MatchString(v) {
+		return
+	}
+	c.identityVersion.mu.Lock()
+	if c.identityVersion.latest == "" || compareVersion(v, c.identityVersion.latest) >= 0 {
+		c.identityVersion.latest = v
+		c.identityVersion.checkedAt = time.Now()
+	}
+	c.identityVersion.mu.Unlock()
+}
+
 func (c *Client) IdentityGateBlocked() (bool, string) {
 	if c == nil || c.chatIdentityOf() != identityCLI {
 		return false, ""
 	}
 	if !c.IdentityStrictGate.Load() {
+		return false, ""
+	}
+	// 版本检查关闭 = 版本未知 = 门禁永不拦截（codex 二轮 P1-3）。在评估期
+	// 强制该不变量，而不是只靠写入侧：否则关闭后一次在途校准的 ObserveLatest
+	// 仍会把快照重新武装，门禁违背「关闭 = 永不触发」的配置承诺。
+	if !c.IdentityVersionCheck.Load() {
 		return false, ""
 	}
 	c.identityVersion.mu.RLock()

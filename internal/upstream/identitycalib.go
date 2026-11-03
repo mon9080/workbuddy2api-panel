@@ -35,6 +35,11 @@ type IdentityCalibResult struct {
 	NewSDK string   `json:"new_sdk"`         // 校准后生效的 SDK 版本
 	Checks []string `json:"checks"`          // 通过的核对项
 	Drift  []string `json:"drift,omitempty"` // 漂移项（Status=drift 时非空）
+
+	// Persisted / PersistError 由面板层填写（校准器只核对、不发布）：
+	// 落盘成功后才热生效；失败时 Status=persist_failed、运行时保持旧版。
+	Persisted    bool   `json:"persisted"`
+	PersistError string `json:"persist_error,omitempty"`
 }
 
 // npmDist URL 与版本一起取（/latest 端点带 dist.tarball）。
@@ -87,8 +92,11 @@ var distFingerprintLiterals = []string{
 
 var reSDKVersion = regexp.MustCompile(`"X-Stainless-Package-Version":"([^"]+)"`)
 
-// RunIdentityStaticCalib 执行静态校准。成功适配后调用方负责把两个版本值
-// 持久化进配置（热覆盖已由本函数写入 Client 状态）。
+// RunIdentityStaticCalib 执行静态校准。
+//
+// 本函数**只核对、不发布**：成功时把候选版本放进返回值（Status=adapted），
+// 由调用方先持久化、再调 SetIdentityVerified 热生效（审查发现 #7：此前的
+// 「先热生效后落盘」会让落盘失败时运行态与磁盘态分叉）。
 func (c *Client) RunIdentityStaticCalib() (*IdentityCalibResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), calibTimeout)
 	defer cancel()
@@ -97,6 +105,9 @@ func (c *Client) RunIdentityStaticCalib() (*IdentityCalibResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("查询 npm latest 失败: %w", err)
 	}
+	// 拿到元数据即发布观测（审查发现 #3）：下面无论 drift / 解包失败 / 调用方
+	// 落盘失败，门禁都能立即看到「官方已有新版」，不必等下一小时巡检。
+	c.ObserveLatest(latest)
 	old := c.EffectiveCLIVersion()
 	res := &IdentityCalibResult{Latest: latest, OldCLI: old, NewCLI: old}
 	if latest == old {
@@ -152,8 +163,8 @@ func (c *Client) RunIdentityStaticCalib() (*IdentityCalibResult, error) {
 			res.Drift = append(res.Drift, "无法从 dist 提取合法 SDK 版本")
 		}
 	} else if len(res.Drift) == 0 {
-		// 全部核对通过：热覆盖生效版本，门禁即解。
-		c.SetIdentityVerified(latest, m[1])
+		// 全部核对通过：只返回候选版本，**不写运行时**——调用方落盘成功后才调用
+		// SetIdentityVerified 热生效（审查发现 #7）。
 		res.NewCLI = latest
 		res.NewSDK = m[1]
 		res.Status = "adapted"
