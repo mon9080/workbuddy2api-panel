@@ -750,6 +750,17 @@ type Client struct {
 	// latest 恒未知，门禁永不触发）。面板热改。
 	IdentityVersionCheck atomic.Bool
 
+	// CalibrationProxy 官方包下载（身份静态校准）专用代理，形如
+	// "http://172.17.0.1:7890"。空 = 直连（沿用传输层的 ProxyFromEnvironment）。
+	//
+	// 为什么要单独一个开关而不是直接用 HTTP_PROXY 环境变量：代理只该服务
+	// 「下载 65MB 官方 tarball」这一件事。环境变量是全进程生效的，会让 chat /
+	// 签到 / 余额刷新也走代理出口 IP，而身份改造的整个前提就是出站指纹与网络
+	// 形态要像真实 CLI——把业务流量送进代理是最容易被上游风控盯上的形态。
+	//
+	// 面板保存配置热生效（atomic.Value 承载 string），空值 = 关闭。
+	CalibrationProxy atomic.Value // string
+
 	// IdentityOS / IdentityArch / IdentityNode x-stainless 环境字段显式覆盖
 	//（逃生舱；默认空 = 真实容器值 + 钉扎 node 版本，不伪装）。
 	IdentityOS   string

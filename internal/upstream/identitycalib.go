@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -246,11 +247,53 @@ var reSDKVersion = regexp.MustCompile(`"X-Stainless-Package-Version":"([^"]+)"`)
 // 本函数**只核对、不发布**：成功时把候选版本放进返回值（Status=adapted），
 // 由调用方先持久化、再调 SetIdentityVerified 热生效（审查发现 #7：此前的
 // 「先热生效后落盘」会让落盘失败时运行态与磁盘态分叉）。
+// calibProxyClient 返回**仅用于本次校准**的 client：配置了 calibration_proxy
+// 时克隆传输层并钉死代理，否则原样返回。
+//
+// 为什么不直接依赖 HTTP_PROXY 环境变量：环境变量是全进程的，会把 chat / 签到 /
+// 余额刷新一起送进代理出口，而身份改造要求业务出站尽可能贴近真实 CLI 的网络
+// 形态。代理只该服务「下载 65MB 官方包」这一件事。
+//
+// 代理地址非法时只告警并回退直连：校准是可选运维动作，配置写错不该让面板
+// 报一个和网络无关的错，更不该静默把请求发去奇怪的地方。
+func (c *Client) calibProxyClient(base *http.Client) *http.Client {
+	raw := ""
+	if c != nil {
+		raw = c.CalibrationProxyURL()
+	}
+	if raw == "" {
+		return base
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" ||
+		(u.Scheme != "http" && u.Scheme != "https") {
+		log.Printf("WARN: [upstream] calibration_proxy=%q 非法（需 http(s)://host:port），本次校准按直连执行", raw)
+		return base
+	}
+	if base == nil {
+		base = http.DefaultClient
+	}
+	tr, ok := base.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		if dt, dok := http.DefaultTransport.(*http.Transport); dok {
+			tr = dt
+		} else {
+			return base
+		}
+	}
+	clone := tr.Clone()
+	clone.Proxy = http.ProxyURL(u)
+	out := *base
+	out.Transport = clone
+	return &out
+}
+
 func (c *Client) RunIdentityStaticCalib() (*IdentityCalibResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), calibTimeout)
 	defer cancel()
 
-	latest, tarball, integrity, err := fetchNPMDist(ctx, c.HTTP)
+	hc := c.calibProxyClient(c.HTTP)
+	latest, tarball, integrity, err := fetchNPMDist(ctx, hc)
 	if err != nil {
 		return nil, fmt.Errorf("查询 npm latest 失败: %w", err)
 	}
@@ -270,7 +313,7 @@ func (c *Client) RunIdentityStaticCalib() (*IdentityCalibResult, error) {
 	}
 	defer os.RemoveAll(tmp)
 
-	distJS, productJSON, err := downloadAndExtract(ctx, c.HTTP, tarball, integrity, tmp)
+	distJS, productJSON, err := downloadAndExtract(ctx, hc, tarball, integrity, tmp)
 	if err != nil {
 		return nil, fmt.Errorf("下载/解包官方包失败: %w", err)
 	}

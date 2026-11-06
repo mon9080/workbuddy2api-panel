@@ -188,6 +188,14 @@ type Config struct {
 		// 均以覆盖值为准；删除配置键即回落编译常量。
 		IdentityVerifiedCLI string `json:"identity_verified_cli"`
 		IdentityVerifiedSDK string `json:"identity_verified_sdk"`
+		// CalibrationProxy 身份静态校准（下载官方 65MB tarball）专用代理，
+		// 形如 "http://172.17.0.1:7890"。空 = 直连。
+		//
+		// 只作用于校准下载：chat / 签到 / 余额刷新等业务出站仍按传输层默认策略，
+		// 不会被这个值拖进代理出口（避免上游风控把整池流量当成异常）。国内服务器
+		// 直连 registry.npmjs.org 常见 100KB/s 级，5 分钟校准预算必然超时。
+		// 面板保存热生效。
+		CalibrationProxy string `json:"calibration_proxy"`
 	} `json:"upstream"`
 
 	Features struct {

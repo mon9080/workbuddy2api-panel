@@ -174,6 +174,8 @@ func main() {
 	up.IdentityVersionCheck.Store(cfg.Upstream.IdentityVersionCheck)
 	// 已适配版本运行时覆盖（面板一键适配写入 config；空 = 编译常量）。
 	up.SetIdentityVerified(cfg.Upstream.IdentityVerifiedCLI, cfg.Upstream.IdentityVerifiedSDK)
+	// 校准下载专用代理（空 = 直连）。只影响一键适配的 tarball 下载。
+	up.SetCalibrationProxy(cfg.Upstream.CalibrationProxy)
 	up.StartIdentityVersionLoop()
 	// 身份生效可见性（交叉审查 P2）：启动打印当前身份族与已适配版本；
 	// cli 身份下 user_agent/client_name 对 chat 路径静默失效，显式 WARN 提示。
@@ -623,6 +625,8 @@ func saveConfigLocked(raw []byte, path string, live *livecfg.Holder, p *pool.Poo
 	up.IdentityVersionCheck.Store(newCfg.Upstream.IdentityVersionCheck)
 	// 已适配版本覆盖热应用（面板一键适配或手工改配置都会走这里；空值回落编译常量）。
 	up.SetIdentityVerified(newCfg.Upstream.IdentityVerifiedCLI, newCfg.Upstream.IdentityVerifiedSDK)
+	// 校准下载代理热应用（只影响下一次「一键适配」的下载，不影响业务出站）。
+	up.SetCalibrationProxy(newCfg.Upstream.CalibrationProxy)
 	if !newCfg.Upstream.IdentityVersionCheck {
 		up.ClearIdentityLatestSnapshot()
 	}

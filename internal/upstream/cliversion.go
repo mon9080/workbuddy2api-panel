@@ -94,6 +94,17 @@ func (c *Client) SetIdentityVerified(cli, sdk string) {
 	c.identityVersion.mu.Unlock()
 }
 
+// SetCalibrationProxy 热设置校准下载专用代理（空串 = 直连）。面板保存配置后调用。
+func (c *Client) SetCalibrationProxy(raw string) {
+	c.CalibrationProxy.Store(strings.TrimSpace(raw))
+}
+
+// CalibrationProxyURL 当前校准下载代理（空串 = 直连）。
+func (c *Client) CalibrationProxyURL() string {
+	v, _ := c.CalibrationProxy.Load().(string)
+	return v
+}
+
 // EffectiveCLIVersion 当前生效的已适配 CLI 版本（运行时覆盖 > 编译常量）。
 // 出站 UA / x-ide-version / harnessVersion 统一经此取值。
 func (c *Client) EffectiveCLIVersion() string {

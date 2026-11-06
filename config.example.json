@@ -61,7 +61,8 @@
     "identity_version_check": true,
     "identity_os": "",
     "identity_arch": "",
-    "identity_node": ""
+    "identity_node": "",
+    "calibration_proxy": ""
   },
   "features": {
     "sanitize_blacklist_fingerprints": true
