@@ -1037,7 +1037,47 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Upstream != nil {
 		currentRate = p.cfg.Upstream.ModelRate
 	}
-	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindow(win, nicks, currentRate))
+	writeJSON(w, http.StatusOK,
+		p.cfg.Usage.SnapshotWindowWithAudit(win, nicks, currentRate, p.ledgerSpent(win)))
+}
+
+// ledgerSpent 汇总窗口内每个账号的**真实扣分**，供「扣除积分审核」列对账。
+//
+// 口径：积分流水里 Delta<0 的条目（余额下降）取绝对值累加，按 uid 分组。正值条目
+// （签到 / 旅行 / 任务奖励）不算扣分，但也不会抵消——它们回答的是"这账号在窗口内
+// 被上游扣了多少"，混入加分会让漏算看起来更小。
+//
+// 窗口用 usage.Window 的同一套 bounds() 解析：表格上方的「扣除积分」按窗口统计，
+// 对账若用另一套口径就会出现"5 分钟的表对 1 小时的流水"这种假差异。
+//
+// 账本未启用时返回 nil（前端显示 —），不返回空 map——两者在展示上等价，但 nil
+// 语义更明确："没有对账数据"而不是"对账结果是 0"。
+func (p *Panel) ledgerSpent(win usage.Window) map[string]float64 {
+	if p.cfg.CreditHistory == nil {
+		return nil
+	}
+	entries := p.cfg.CreditHistory.Read(0)
+	if len(entries) == 0 {
+		return nil
+	}
+	from, to := win.Bounds()
+	spent := map[string]float64{}
+	for _, e := range entries {
+		if e.Delta >= 0 {
+			continue
+		}
+		if !from.IsZero() && e.Time.Before(from) {
+			continue
+		}
+		if !to.IsZero() && e.Time.After(to) {
+			continue
+		}
+		spent[e.UID] += float64(-e.Delta)
+	}
+	if len(spent) == 0 {
+		return nil
+	}
+	return spent
 }
 
 // parseTimeParam 解析时间查询参数：unix 秒（前端默认）或 RFC3339（便于手工调

@@ -438,6 +438,16 @@ type CreditAgg struct {
 	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
 	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
+	// LedgerSpent 窗口内该账号的**真实余额下降**（正值，来自积分流水里 Delta<0
+	// 的条目取绝对值求和）。Credits 是上游在响应里声明的扣费，两者不是同一量：
+	// 前者是账实，后者是账记。
+	//
+	// 指针类型用于区分"没有对账数据"与"真实扣分为 0"——账本未启用或该账号在窗口
+	// 内没有负向流水时是 nil，前端显示 —，不能伪造成 0（那会被读成"完全吻合"）。
+	LedgerSpent *float64 `json:"ledger_spent,omitempty"`
+	// AuditDiff = Credits - LedgerSpent。负值表示上游声明扣得比实际少（漏算），
+	// 正值表示记录扣得比实际多（多半是流水采样不完整）。同为指针，nil = 无从对账。
+	AuditDiff *float64 `json:"audit_diff,omitempty"`
 }
 
 type creditAcc struct {
@@ -513,6 +523,11 @@ func (w Window) bounds() (time.Time, time.Time) {
 	return time.Now().Truncate(time.Hour).Add(-time.Duration(h-1) * time.Hour), time.Time{}
 }
 
+// Bounds 导出 bounds 的结果，供调用方把**同一窗口**套到别的数据源上（目前是
+// 「扣除积分审核」用积分流水对账）。两处各算一遍窗口最容易漂移——滚动窗口的
+// 基准是 time.Now()，跨整点时两边会差一小时。
+func (w Window) Bounds() (time.Time, time.Time) { return w.bounds() }
+
 // bucketTime 把桶 scope 解析成本地时间；脏 scope 返回 false（不进任何口径）。
 func bucketTime(scope string) (time.Time, bool) {
 	if strings.HasPrefix(scope, "h:") {
@@ -551,6 +566,20 @@ func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, current
 // 生效"，已废弃）。小时桶按整点入窗；日桶（Rollup 折叠出的长期数据）按日起点入窗，
 // 故小时窗口天然不含更早的日桶。
 func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate func(realm, model string) string) Snapshot {
+	return r.SnapshotWindowWithAudit(w, nicks, currentRate, nil)
+}
+
+// SnapshotWindowWithAudit 与 SnapshotWindow 相同，额外把每个 uid 在**同一窗口内**
+// 的真实扣分（积分流水里 Delta<0 取绝对值之和）带进账号维度的积分行，算出
+// 「扣除积分审核」差异。
+//
+// spentByUID 为 nil 表示调用方没有对账数据（账本未启用）：此时行里不填
+// LedgerSpent/AuditDiff，前端显示 —。传空 map 与 nil 等价——"窗口内无任何负向
+// 流水"和"没有账本"在展示上都是无从对账，不该冒出一个满屏为 0 的假吻合。
+//
+// usage 包不依赖 credithist：窗口过滤与求和留给调用方，这里只做算术。这样聚合层
+// 保持纯函数式可测，也不会因为账本实现变化而连带改聚合测试。
+func (r *Recorder) SnapshotWindowWithAudit(w Window, nicks map[string]string, currentRate func(realm, model string) string, spentByUID map[string]float64) Snapshot {
 	if r == nil {
 		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
 	}
@@ -683,6 +712,21 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	}
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]
+	}
+	// 对账：只给账号维度回填。积分流水只认 uid，没有模型字段，按模型算「实际
+	// 扣分」只能凭空摊派，宁可缺一列也不编一个数出来。
+	if len(spentByUID) > 0 {
+		for i := range snap.CreditByAccount {
+			row := &snap.CreditByAccount[i]
+			spent, ok := spentByUID[row.Key]
+			if !ok {
+				continue
+			}
+			s := spent
+			diff := row.Credits - spent
+			row.LedgerSpent = &s
+			row.AuditDiff = &diff
+		}
 	}
 
 	// 日点（升序）+ 小时点（升序）拼成一条连续时序。

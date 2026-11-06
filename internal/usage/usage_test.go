@@ -353,3 +353,76 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
 	}
 }
+
+// 扣除积分审核：账号行把「记录扣分」（usage.credit 累计）与「真实扣分」
+// （调用方给的 spentByUID）相减，差值 = Credits - LedgerSpent。
+func TestSnapshotWindowWithAuditDiff(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 上游声明扣 5 分，但账号实际掉了 10 分 → 差异 -5（漏算）。
+	r.Add(now, "cn", "uid1", "deepseek-v4.1-flash",
+		Delta{Credit: 5, HasCredit: true, PromptTokens: 100, HasPromptTokens: true}, true)
+	// 另一个账号没有对账数据 → 两个指针都留空，前端显示 —。
+	r.Add(now, "cn", "uid2", "deepseek-v4.1-flash",
+		Delta{Credit: 2, HasCredit: true, PromptTokens: 10, HasPromptTokens: true}, true)
+
+	s := r.SnapshotWindowWithAudit(Window{Hours: 1}, nil, nil,
+		map[string]float64{"uid1": 10})
+	if len(s.CreditByAccount) != 2 {
+		t.Fatalf("credit_by_account = %d 行, want 2", len(s.CreditByAccount))
+	}
+	var got *CreditAgg
+	for i := range s.CreditByAccount {
+		if s.CreditByAccount[i].Key == "uid1" {
+			got = &s.CreditByAccount[i]
+		} else if s.CreditByAccount[i].LedgerSpent != nil || s.CreditByAccount[i].AuditDiff != nil {
+			t.Fatalf("uid2 无对账数据却回填了指针: %+v", s.CreditByAccount[i])
+		}
+	}
+	if got == nil {
+		t.Fatal("缺 uid1 行")
+	}
+	if got.LedgerSpent == nil || *got.LedgerSpent != 10 {
+		t.Fatalf("ledger_spent = %v, want 10", got.LedgerSpent)
+	}
+	if got.AuditDiff == nil || *got.AuditDiff != -5 {
+		t.Fatalf("audit_diff = %v, want -5（记录 5 - 实际 10）", got.AuditDiff)
+	}
+	// 模型维度没有 uid 归属，不能凭空摊派。
+	for _, m := range s.CreditByModel {
+		if m.LedgerSpent != nil || m.AuditDiff != nil {
+			t.Fatalf("模型行不该有对账字段: %+v", m)
+		}
+	}
+}
+
+// 没有对账数据（nil / 空 map）时，行为必须与旧的 SnapshotWindow 完全一致。
+func TestSnapshotWindowWithAuditNoData(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "uid1", "m", Delta{Credit: 3, HasCredit: true}, true)
+	for _, spent := range []map[string]float64{nil, {}} {
+		s := r.SnapshotWindowWithAudit(Window{Hours: 1}, nil, nil, spent)
+		if len(s.CreditByAccount) != 1 {
+			t.Fatalf("spent=%v: credit_by_account = %d 行, want 1", spent, len(s.CreditByAccount))
+		}
+		row := s.CreditByAccount[0]
+		if row.LedgerSpent != nil || row.AuditDiff != nil {
+			t.Fatalf("spent=%v: 无数据时不该回填对账字段: %+v", spent, row)
+		}
+		if row.Credits != 3 {
+			t.Fatalf("spent=%v: credits = %v, want 3", spent, row.Credits)
+		}
+	}
+}
+
+// 窗口外账号不出现在对账结果里，也不能因为出现了就伪造一行 0。
+func TestSnapshotWindowWithAuditUnknownUIDIgnored(t *testing.T) {
+	r := New("")
+	r.Add(time.Now(), "cn", "uid1", "m", Delta{Credit: 1, HasCredit: true}, true)
+	s := r.SnapshotWindowWithAudit(Window{Hours: 1}, nil, nil,
+		map[string]float64{"ghost": 99})
+	if len(s.CreditByAccount) != 1 || s.CreditByAccount[0].AuditDiff != nil {
+		t.Fatalf("未知 uid 不该回填: %+v", s.CreditByAccount)
+	}
+}

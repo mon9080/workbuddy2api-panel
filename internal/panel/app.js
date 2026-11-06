@@ -2332,7 +2332,8 @@ function renderUsageDim() {
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
 
-/* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
+/* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。
+   账号维度多一列「扣除积分审核」：积分流水只认 uid，模型维度无从归属，故不加。 */
 function usCreditHead(dim) {
   return dim === 'model'
     ? '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
@@ -2340,7 +2341,38 @@ function usCreditHead(dim) {
       '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>'
     : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
       '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
+      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th>' +
+      '<th class="num">扣除积分审核</th></tr>';
+}
+
+/* 扣除积分审核：把「上游声明的扣费」与「账号余额的真实下降」对账。
+ *
+   差值 = 记录扣分 − 实际扣分。负数 = 上游声明扣得比实际少（漏算，红），
+   0 = 吻合（灰），正数 = 记录扣得比实际多（多半是流水采样不全，黄）。
+   ledger_spent / audit_diff 缺失表示没有对账数据（账本未启用或窗口内无负向流水），
+   显示 — 而不是 0——0 会被读成"完全吻合"。 */
+function creditAuditCell(row) {
+  const diff = row.audit_diff;
+  if (diff == null) {
+    return '<span class="muted" title="本窗口没有该账号的积分流水，无法对账">—</span>';
+  }
+  const v = Number(diff);
+  if (!isFinite(v)) return '<span class="muted">—</span>';
+  // 两位小数、去尾零，与「扣除积分」列同口径。就地实现而不调 fmtCredit：
+  // 该函数在另一段（上方的通用格式化区），本函数要能独立被单测切片执行。
+  const num = n => {
+    const x = Number(n);
+    if (!isFinite(x)) return '—';
+    return String(Number(x.toFixed(2)));
+  };
+  const tip = '记录扣分 ' + num(row.credits) +
+    ' / 实际扣分 ' + num(row.ledger_spent) +
+    (v < 0 ? '（上游声明少于实际下降）' : (v > 0 ? '（记录多于实际下降）' : '（一致）'));
+  // 抹掉浮点噪声：1.0000000000000002 这类残留不该显示成差异。
+  const flat = Math.abs(v) < 0.005;
+  const txt = flat ? '0' : (v > 0 ? '+' : '-') + num(Math.abs(v));
+  const color = flat ? 'var(--ink-3)' : (v < 0 ? 'var(--bad)' : 'var(--warn)');
+  return '<span style="color:' + color + '" title="' + esc(tip) + '">' + esc(txt) + '</span>';
 }
 
 /* 缓存命中率（issue #92）：颜色即健康度——≥90% 绿 / 80–90% 黄 / <80% 红，
@@ -2385,8 +2417,9 @@ function renderCreditDim() {
         '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
         '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
         '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
+        '<td class="num">' + creditAuditCell(row) + '</td>' +
         '</tr>';
-    }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
+    }).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>';
   }
   $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
     account: (d.credit_by_account || []).length,
@@ -2699,7 +2732,7 @@ async function loadUsage() {
     $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, null);
     $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
     $('usDimBody').innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>';
-    $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
+    $('usCreditBody').innerHTML = '<tr><td colspan="8" class="empty">读取用量失败</td></tr>';
   }
 }
 
