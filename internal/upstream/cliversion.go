@@ -29,7 +29,7 @@ const (
 	// VerifiedCLIVersion 已适配（oracle 校准通过）的官方 CodeBuddy CLI 版本。
 	// 证据：2026-11-02 对 2.179.2（npm latest）mock 驱动捕获 golden
 	// （_codebuddy_oracle/captures/requests.jsonl），UA `CLI/2.179.2 CodeBuddy/2.179.2`。
-	VerifiedCLIVersion = "2.180.0"
+	VerifiedCLIVersion = "2.181.0"
 
 	// VerifiedSDKVersion 2.179.2 内嵌 stainless SDK 的 X-Stainless-Package-Version。
 	// 证据：官方包 dist/codebuddy.js getPlatformProperties 硬编码 "7.39.0"。
@@ -39,7 +39,7 @@ const (
 	// VerifiedNodeVersion oracle 校准运行所用的 node 版本（X-Stainless-Runtime-Version，
 	// 官方取 process.version，带 v 前缀）。钉扎与校准运行一致的值保证指纹自洽，
 	// 不在生产容器里装 node 探测。
-	VerifiedNodeVersion = "v24.22.1"
+	VerifiedNodeVersion = "v24.22.2"
 
 	// npmLatestURL 官方 CLI 的 npm latest 元数据端点（只认 latest dist-tag，
 	// next/dev 预发布通道一律不采）。
